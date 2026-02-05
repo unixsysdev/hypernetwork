@@ -25,7 +25,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import wandb
 
@@ -74,6 +74,7 @@ class TrainingConfig:
     
     # Logging
     wandb_project: str = "hypernetwork-distillation"
+    wandb_enabled: bool = True
     log_every_steps: int = 10
     
     # Cached teacher logits (offline distillation)
@@ -142,24 +143,33 @@ def compute_distillation_loss(
     
     We only compute loss on positions where attention_mask == 1.
     This handles variable-length sequences in a batch.
+    
+    FIX: Properly excludes masked positions from loss computation
+    instead of relying on kl_div reduction='batchmean'.
     """
-    # Mask out padding positions
-    # attention_mask: [B, L]
-    # Expand to [B, L, 1] for masking logits
-    mask = attention_mask.unsqueeze(-1).float()
+    B, L, V = student_logits.shape
     
-    # Apply mask (set masked positions to very negative value)
-    large_neg = -1e9
-    student_logits = student_logits * mask + large_neg * (1 - mask)
-    teacher_logits = teacher_logits * mask + large_neg * (1 - mask)
+    # Get top-K from teacher
+    teacher_topk_values, teacher_topk_indices = torch.topk(
+        teacher_logits, top_k, dim=-1
+    )  # [B, L, K]
     
-    # Compute top-K KL divergence
-    loss = top_k_kl_divergence(
-        student_logits,
-        teacher_logits,
-        k=top_k,
-        temperature=temperature,
-    )
+    # Gather corresponding student logits
+    student_topk_values = torch.gather(
+        student_logits, dim=-1, index=teacher_topk_indices
+    )  # [B, L, K]
+    
+    # Apply temperature and compute probabilities
+    teacher_probs = F.softmax(teacher_topk_values / temperature, dim=-1)
+    student_log_probs = F.log_softmax(student_topk_values / temperature, dim=-1)
+    
+    # KL per position: sum over K vocab entries
+    kl_per_pos = F.kl_div(student_log_probs, teacher_probs, reduction='none').sum(dim=-1)  # [B, L]
+    
+    # Apply mask and average over valid positions only
+    mask = attention_mask.float()  # [B, L]
+    masked_kl = kl_per_pos * mask
+    loss = masked_kl.sum() / (mask.sum() + 1e-8)
     
     return loss
 
@@ -279,7 +289,7 @@ class DistillationTrainer:
         )
         
         # Setup mixed precision
-        self.scaler = GradScaler()
+        self.scaler = GradScaler("cuda")
         
         # Pre-compile forward function for train_step_parallel (saves 30s per step!)
         self._compiled_forward = None
@@ -443,8 +453,8 @@ class DistillationTrainer:
             
             total_loss += loss
         
-        # Average loss over batch
-        loss = total_loss / batch_size
+        # Average loss over batch AND accumulation steps for correct gradient scaling
+        loss = total_loss / batch_size / self.config.gradient_accumulation_steps
         
         # 6. Backprop
         self.scaler.scale(loss).backward()
@@ -511,8 +521,8 @@ class DistillationTrainer:
             )
             losses.append(loss)
         
-        # Sum and average losses (all on graph)
-        total_loss = torch.stack(losses).mean()
+        # Sum and average losses, scaled for gradient accumulation
+        total_loss = torch.stack(losses).mean() / self.config.gradient_accumulation_steps
         
         # Backprop
         self.scaler.scale(total_loss).backward()
@@ -536,7 +546,7 @@ class DistillationTrainer:
         lora_dict = self.hypernetwork.get_lora_dict(lora_output, batch_idx=batch_idx)
         
         # Use autocast for mixed precision (bfloat16 on H200)
-        with self.lora_injector.apply_lora(lora_dict), autocast(dtype=torch.bfloat16):
+        with self.lora_injector.apply_lora(lora_dict), autocast("cuda", dtype=torch.bfloat16):
             student_outputs = self.student(
                 input_ids=input_ids[batch_idx:batch_idx+1],
                 attention_mask=attention_mask[batch_idx:batch_idx+1],
@@ -597,6 +607,7 @@ class DistillationTrainer:
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad()
+                self.scheduler.step()
                 
                 # Logging
                 if (step + 1) % self.config.log_every_steps == 0:
@@ -641,10 +652,13 @@ class DistillationTrainer:
     def train(self):
         """Main training loop."""
         # Setup wandb
-        wandb.init(
-            project=self.config.wandb_project,
-            config=vars(self.config),
-        )
+        if self.config.wandb_enabled:
+            wandb.init(
+                project=self.config.wandb_project,
+                config=vars(self.config),
+            )
+        else:
+            wandb.init(mode="disabled")
         
         # Create dataloader
         dataloader = create_dataloader(
@@ -655,23 +669,30 @@ class DistillationTrainer:
             teacher_cache_dir=self.config.teacher_cache_dir if self.config.use_cached_teacher else None,
         )
         
-        # Setup scheduler
-        total_steps = len(dataloader) * self.config.epochs
-        self.scheduler = CosineAnnealingLR(
+        # Setup scheduler: warmup → cosine decay
+        steps_per_epoch = len(dataloader) // self.config.gradient_accumulation_steps
+        warmup_steps = self.config.warmup_epochs * steps_per_epoch
+        total_steps = self.config.epochs * steps_per_epoch
+        
+        warmup_scheduler = LinearLR(
             self.optimizer,
-            T_max=total_steps,
+            start_factor=self.config.warmup_lr / self.config.learning_rate,
+            end_factor=1.0,
+            total_iters=warmup_steps,
+        )
+        main_scheduler = CosineAnnealingLR(
+            self.optimizer,
+            T_max=total_steps - warmup_steps,
             eta_min=self.config.learning_rate * 0.1,
+        )
+        self.scheduler = SequentialLR(
+            self.optimizer,
+            schedulers=[warmup_scheduler, main_scheduler],
+            milestones=[warmup_steps],
         )
         
         # Training loop
         for epoch in range(self.config.epochs):
-            # Warmup phase uses lower LR
-            if epoch < self.config.warmup_epochs:
-                for param_group in self.optimizer.param_groups:
-                    param_group["lr"] = self.config.warmup_lr
-            else:
-                for param_group in self.optimizer.param_groups:
-                    param_group["lr"] = self.config.learning_rate
             
             logger.info(f"\n=== Epoch {epoch + 1}/{self.config.epochs} ===")
             

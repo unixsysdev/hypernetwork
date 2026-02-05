@@ -30,7 +30,7 @@ class LoRAConfig:
         alpha: int = 32,
         dropout: float = 0.1,
         # All layers use the same projection names
-        target_modules: List[str] = None,
+        target_modules: Optional[List[str]] = None,
         # Model architecture
         num_layers: int = 48,
         hidden_dim: int = 2048,
@@ -372,11 +372,20 @@ def test_hypernetwork():
     print("=" * 60)
     
     config = LoRAConfig(rank=16, alpha=32, num_layers=48, hidden_dim=2048)
+    
+    # Generate mock layer names to satisfy target_layer_names requirement
+    mock_layer_names = [
+        f"model.layers.{i}.self_attn.{m}"
+        for i in range(48)
+        for m in ["q_proj", "k_proj", "v_proj", "o_proj"]
+    ]
+    
     hypernet = AgenticHyperNetwork(
         hidden_dim=2048,
         num_encoder_layers=4,
         num_heads=8,
         lora_config=config,
+        target_layer_names=mock_layer_names,
     )
     
     # Parameter counts
