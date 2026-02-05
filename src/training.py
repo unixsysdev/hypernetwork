@@ -210,21 +210,22 @@ class DistillationTrainer:
         for param in self.student.parameters():
             param.requires_grad = False
         
-        # Load Teacher model (frozen, quantized)
-        logger.info(f"Loading Teacher model: {self.config.teacher_model_id}")
-        # Note: For actual 8xH200 setup, you'd use vLLM here
-        # This is the transformers fallback for smaller setups
-        self.teacher = AutoModelForCausalLM.from_pretrained(
-            self.config.teacher_model_id,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            trust_remote_code=True,
-            # For FP8 quantization, use:
-            # load_in_8bit=True,  # or quantization_config for FP8
-        )
-        self.teacher.eval()
-        for param in self.teacher.parameters():
-            param.requires_grad = False
+        # Load Teacher model ONLY if not using cached logits
+        if not self.config.use_cached_teacher:
+            logger.info(f"Loading Teacher model: {self.config.teacher_model_id}")
+            logger.warning("Runtime teacher inference is SLOW and requires massive VRAM!")
+            self.teacher = AutoModelForCausalLM.from_pretrained(
+                self.config.teacher_model_id,
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
+                trust_remote_code=True,
+            )
+            self.teacher.eval()
+            for param in self.teacher.parameters():
+                param.requires_grad = False
+        else:
+            logger.info("Using cached teacher logits - Teacher model NOT loaded")
+            self.teacher = None
         
         # Initialize Hypernetwork
         logger.info("Initializing Hypernetwork...")
@@ -276,6 +277,52 @@ class DistillationTrainer:
                 embed_layer = self.student.get_input_embeddings()
             return embed_layer(input_ids)
     
+    def _compute_sparse_kl_loss(
+        self,
+        student_logits: torch.Tensor,
+        teacher_values: torch.Tensor,
+        teacher_indices: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute KL divergence using sparse (top-k) teacher logits.
+        
+        This is MUCH faster than dense computation since we only
+        need to gather K=128 student logits instead of full vocab.
+        
+        Args:
+            student_logits: [L, V] - Full student logits
+            teacher_values: [L, K] - Top-K teacher logit values
+            teacher_indices: [L, K] - Top-K teacher vocabulary indices
+            attention_mask: [L] - Mask (1=compute, 0=ignore)
+        
+        Returns:
+            KL divergence loss (scalar)
+        """
+        L, V = student_logits.shape
+        K = teacher_values.shape[-1]
+        
+        # Gather student logits at teacher's top-K indices
+        # student_logits: [L, V], indices: [L, K] -> gathered: [L, K]
+        student_gathered = torch.gather(student_logits, dim=-1, index=teacher_indices)
+        
+        # Apply temperature and convert to probabilities
+        temperature = self.config.temperature
+        teacher_probs = F.softmax(teacher_values / temperature, dim=-1)  # [L, K]
+        student_log_probs = F.log_softmax(student_gathered / temperature, dim=-1)  # [L, K]
+        
+        # Compute KL divergence per position
+        kl_per_pos = F.kl_div(student_log_probs, teacher_probs, reduction='none').sum(dim=-1)  # [L]
+        
+        # Apply attention mask
+        mask = attention_mask.float()
+        masked_kl = kl_per_pos * mask
+        
+        # Average over non-masked positions
+        loss = masked_kl.sum() / (mask.sum() + 1e-8)
+        
+        return loss
+    
     def train_step(
         self,
         batch: Dict[str, torch.Tensor],
@@ -286,7 +333,7 @@ class DistillationTrainer:
         1. Get prompt embeddings from Student
         2. Hypernetwork generates LoRA weights
         3. Student forward pass with LoRA
-        4. Teacher forward pass (scoring only)
+        4. Get teacher logits (from cache OR runtime)
         5. Compute KL divergence loss
         6. Backprop to Hypernetwork
         
@@ -298,6 +345,18 @@ class DistillationTrainer:
         prompt_ids = batch["prompt_ids"].to(self.device)
         prompt_mask = batch["prompt_mask"].to(self.device)
         
+        # Check if we have cached teacher logits
+        has_cached_teacher = (
+            self.config.use_cached_teacher and 
+            "teacher_values" in batch and 
+            "teacher_indices" in batch
+        )
+        
+        if has_cached_teacher:
+            # Load pre-computed teacher logits (top-k sparse format)
+            teacher_values = batch["teacher_values"].to(self.device)  # [B, L, K]
+            teacher_indices = batch["teacher_indices"].to(self.device)  # [B, L, K]
+        
         # 1. Get prompt embeddings (no grad through Student)
         with torch.no_grad():
             prompt_embeds = self.get_student_embeddings(prompt_ids)
@@ -305,16 +364,14 @@ class DistillationTrainer:
         # 2. Hypernetwork generates LoRA (GRADIENTS START HERE)
         lora_output = self.hypernetwork(prompt_embeds, prompt_mask)
         
-        # Convert to dict format for injection
-        # For batched training, we process one sample at a time
-        # TODO: Optimize for batched LoRA injection
+        # Process samples (sequential for now, TODO: batched LoRA)
         batch_size = input_ids.shape[0]
         total_loss = 0.0
         
         for b in range(batch_size):
             lora_dict = self.hypernetwork.get_lora_dict(lora_output, batch_idx=b)
             
-            # 3. Student forward with LoRA (using hook-based injection)
+            # 3. Student forward with LoRA
             with self.lora_injector.apply_lora(lora_dict):
                 student_outputs = self.student(
                     input_ids=input_ids[b:b+1],
@@ -322,22 +379,32 @@ class DistillationTrainer:
                 )
                 student_logits = student_outputs.logits
             
-            # 4. Teacher forward (no grad, just scoring)
-            with torch.no_grad():
-                teacher_outputs = self.teacher(
-                    input_ids=input_ids[b:b+1],
-                    attention_mask=attention_mask[b:b+1],
+            # 4. Get teacher logits
+            if has_cached_teacher:
+                # Use cached sparse teacher logits
+                loss = self._compute_sparse_kl_loss(
+                    student_logits[0],  # [L, V]
+                    teacher_values[b],   # [L, K]
+                    teacher_indices[b],  # [L, K]
+                    attention_mask[b],   # [L]
                 )
-                teacher_logits = teacher_outputs.logits
+            else:
+                # Runtime teacher inference (SLOW, requires massive VRAM)
+                with torch.no_grad():
+                    teacher_outputs = self.teacher(
+                        input_ids=input_ids[b:b+1],
+                        attention_mask=attention_mask[b:b+1],
+                    )
+                    teacher_logits = teacher_outputs.logits
+                
+                loss = compute_distillation_loss(
+                    student_logits,
+                    teacher_logits,
+                    attention_mask[b:b+1],
+                    top_k=self.config.top_k_logits,
+                    temperature=self.config.temperature,
+                )
             
-            # 5. Compute loss
-            loss = compute_distillation_loss(
-                student_logits,
-                teacher_logits,
-                attention_mask[b:b+1],
-                top_k=self.config.top_k_logits,
-                temperature=self.config.temperature,
-            )
             total_loss += loss
         
         # Average loss over batch
@@ -436,6 +503,7 @@ class DistillationTrainer:
             batch_size=self.config.batch_size,
             max_prompt_tokens=self.config.max_prompt_tokens,
             max_trajectory_tokens=self.config.max_trajectory_tokens,
+            teacher_cache_dir=self.config.teacher_cache_dir if self.config.use_cached_teacher else None,
         )
         
         # Setup scheduler
