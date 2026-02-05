@@ -95,6 +95,17 @@ def cache_with_vllm(
     logger.info(f"Loading Teacher with vLLM: {teacher_model}")
     logger.info(f"Tensor parallel size: {tensor_parallel_size}")
     
+    # Check for FP8 support (H200, H100, etc.)
+    fp8_enabled = False
+    try:
+        if torch.cuda.is_available():
+            capability = torch.cuda.get_device_capability()
+            if capability[0] >= 9:  # Hopper+
+                fp8_enabled = True
+                logger.info("FP8 quantization: ENABLED (Hopper GPU detected)")
+    except Exception:
+        pass
+    
     # Initialize vLLM
     llm = LLM(
         model=teacher_model,
@@ -102,8 +113,7 @@ def cache_with_vllm(
         max_model_len=max_tokens,
         gpu_memory_utilization=gpu_memory_utilization,
         trust_remote_code=True,
-        # Enable FP8 for memory efficiency if available
-        # quantization="fp8",  # Uncomment if supported
+        quantization="fp8" if fp8_enabled else None,
     )
     
     tokenizer = llm.get_tokenizer()

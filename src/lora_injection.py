@@ -107,8 +107,9 @@ class HookBasedLoRAInjector:
                 module = get_module_by_name(self.model, name)
                 
                 if module is None:
-                    # Module not found - skip silently for now
-                    # TODO: Add warning in debug mode
+                    # Module not found - log for debugging
+                    import logging
+                    logging.getLogger(__name__).debug(f"Module not found: {name}")
                     continue
                     
                 if not isinstance(module, nn.Linear):

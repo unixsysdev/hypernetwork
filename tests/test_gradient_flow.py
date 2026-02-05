@@ -139,13 +139,16 @@ def test_zero_initialization():
     
     student = MockStudent()
     
+    # Discover target layers (simulates real behavior)
+    target_layers = ["q_proj", "k_proj"]
+    
     config = LoRAConfig(rank=8, alpha=16, num_layers=2, hidden_dim=64)
     hypernet = AgenticHyperNetwork(
         hidden_dim=64,
         num_encoder_layers=1,
         num_heads=2,
         lora_config=config,
-        layer_path_template="{module}",  # Simple naming for mock
+        target_layer_names=target_layers,  # NEW API - pass discovered layers
     )
     
     injector = HookBasedLoRAInjector(student, scaling=2.0)

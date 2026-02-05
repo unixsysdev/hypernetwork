@@ -24,7 +24,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.cuda.amp import autocast, GradScaler
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import wandb
@@ -247,9 +247,15 @@ class DistillationTrainer:
         
         # Initialize Hypernetwork with ACTUAL discovered layer names
         logger.info("Initializing Hypernetwork with discovered layer names...")
+        
+        # Auto-detect Student hidden_dim from model config
+        student_hidden_dim = getattr(self.student.config, 'hidden_size', self.config.hidden_dim)
+        logger.info(f"Student hidden_dim: {student_hidden_dim}")
+        
         lora_config = LoRAConfig(
             rank=self.config.lora_rank,
             alpha=self.config.lora_alpha,
+            hidden_dim=student_hidden_dim,  # Use actual Student dimension
         )
         self.hypernetwork = AgenticHyperNetwork(
             hidden_dim=self.config.hidden_dim,
@@ -275,6 +281,17 @@ class DistillationTrainer:
         # Setup mixed precision
         self.scaler = GradScaler()
         
+        # Pre-compile forward function for train_step_parallel (saves 30s per step!)
+        self._compiled_forward = None
+        try:
+            self._compiled_forward = torch.compile(
+                self._single_sample_forward, 
+                mode="reduce-overhead"
+            )
+            logger.info("torch.compile: Enabled (reduce-overhead mode)")
+        except Exception as e:
+            logger.warning(f"torch.compile not available: {e}")
+        
         logger.info("Setup complete!")
         
     def get_student_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -298,12 +315,14 @@ class DistillationTrainer:
         """
         Compute KL divergence using sparse (top-k) teacher logits.
         
-        This is MUCH faster than dense computation since we only
-        need to gather K=128 student logits instead of full vocab.
+        IMPORTANT: teacher_values from vLLM are LOG PROBABILITIES (already log_softmax).
+        We need to handle them correctly:
+        - teacher_values = log P(teacher)  (FROM vLLM prompt_logprobs)
+        - student needs log_softmax applied
         
         Args:
-            student_logits: [L, V] - Full student logits
-            teacher_values: [L, K] - Top-K teacher logit values
+            student_logits: [L, V] - Full student logits (raw, not softmaxed)
+            teacher_values: [L, K] - Top-K teacher LOG PROBABILITIES
             teacher_indices: [L, K] - Top-K teacher vocabulary indices
             attention_mask: [L] - Mask (1=compute, 0=ignore)
         
@@ -314,15 +333,21 @@ class DistillationTrainer:
         K = teacher_values.shape[-1]
         
         # Gather student logits at teacher's top-K indices
-        # student_logits: [L, V], indices: [L, K] -> gathered: [L, K]
         student_gathered = torch.gather(student_logits, dim=-1, index=teacher_indices)
         
-        # Apply temperature and convert to probabilities
+        # Apply temperature
         temperature = self.config.temperature
-        teacher_probs = F.softmax(teacher_values / temperature, dim=-1)  # [L, K]
+        
+        # Student: apply log_softmax to raw logits (restricted to top-K for approximation)
         student_log_probs = F.log_softmax(student_gathered / temperature, dim=-1)  # [L, K]
         
-        # Compute KL divergence per position
+        # Teacher: values are ALREADY log probs from vLLM!
+        # Just apply temperature scaling to match student
+        teacher_log_probs = teacher_values / temperature  # [L, K]
+        teacher_probs = torch.exp(teacher_log_probs)  # [L, K] - convert to probs for KL
+        teacher_probs = teacher_probs / teacher_probs.sum(dim=-1, keepdim=True)  # Renormalize over top-K
+        
+        # Compute KL divergence per position: sum_k P(k) * [log P(k) - log Q(k)]
         kl_per_pos = F.kl_div(student_log_probs, teacher_probs, reduction='none').sum(dim=-1)  # [L]
         
         # Apply attention mask
@@ -474,11 +499,8 @@ class DistillationTrainer:
         # The actual compute happens on GPU so this overlaps nicely
         losses = []
         
-        # Use torch.compile for faster execution if available
-        try:
-            forward_fn = torch.compile(self._single_sample_forward, mode="reduce-overhead")
-        except Exception:
-            forward_fn = self._single_sample_forward
+        # Use pre-compiled forward function (compiled during setup, NOT here!)
+        forward_fn = self._compiled_forward or self._single_sample_forward
         
         for b in range(batch_size):
             loss = forward_fn(
@@ -513,7 +535,8 @@ class DistillationTrainer:
         """Process a single sample - separated for potential torch.compile."""
         lora_dict = self.hypernetwork.get_lora_dict(lora_output, batch_idx=batch_idx)
         
-        with self.lora_injector.apply_lora(lora_dict):
+        # Use autocast for mixed precision (bfloat16 on H200)
+        with self.lora_injector.apply_lora(lora_dict), autocast(dtype=torch.bfloat16):
             student_outputs = self.student(
                 input_ids=input_ids[batch_idx:batch_idx+1],
                 attention_mask=attention_mask[batch_idx:batch_idx+1],
