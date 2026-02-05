@@ -97,38 +97,51 @@ def compute_distillation_loss(
     temperature: float = 1.0,
 ) -> torch.Tensor:
     """
-    Compute the full distillation loss with masking.
+    Compute the full distillation loss with masking using chunked computation.
+    
+    CHUNKED to avoid OOM: Full [B, L, V] at 131K = 8×131K×152K×2 = 318GB!
+    Chunked: [B, 1024, V] = 8×1024×152K×2 = 2.4GB per chunk.
     
     We only compute loss on positions where attention_mask == 1.
     This handles variable-length sequences in a batch.
-    
-    FIX: Properly excludes masked positions from loss computation
-    instead of relying on kl_div reduction='batchmean'.
     """
     B, L, V = student_logits.shape
+    chunk_size = 1024
     
-    # Get top-K from teacher
+    # Get top-K from teacher (this is OK, teacher_logits is [B, L, V] but we just need indices)
     teacher_topk_values, teacher_topk_indices = torch.topk(
         teacher_logits, top_k, dim=-1
     )  # [B, L, K]
     
-    # CRITICAL: Apply log_softmax over FULL vocab BEFORE gathering!
-    # This ensures the normalization constant is correct.
-    student_log_probs_full = F.log_softmax(student_logits / temperature, dim=-1)  # [B, L, V]
-    student_log_probs = torch.gather(student_log_probs_full, dim=-1, index=teacher_topk_indices)  # [B, L, K]
-    
-    # Teacher: softmax over just top-K (this is an approximation, but for teacher it's OK)
+    # Teacher probs (over top-K only, lightweight)
     teacher_probs = F.softmax(teacher_topk_values / temperature, dim=-1)  # [B, L, K]
     
-    # KL per position: sum over K vocab entries
-    kl_per_pos = F.kl_div(student_log_probs, teacher_probs, reduction='none').sum(dim=-1)  # [B, L]
+    total_kl = 0.0
+    total_tokens = 0.0
     
-    # Apply mask and average over valid positions only
-    mask = attention_mask.float()  # [B, L]
-    masked_kl = kl_per_pos * mask
-    loss = masked_kl.sum() / (mask.sum() + 1e-8)
+    for start in range(0, L, chunk_size):
+        end = min(start + chunk_size, L)
+        
+        # Only materialize [B, chunk, V] - 2.4GB instead of 318GB
+        chunk_logits = student_logits[:, start:end, :]  # [B, C, V]
+        chunk_log_probs_full = F.log_softmax(chunk_logits / temperature, dim=-1)  # [B, C, V]
+        chunk_log_probs = torch.gather(
+            chunk_log_probs_full, dim=-1, index=teacher_topk_indices[:, start:end, :]
+        )  # [B, C, K]
+        
+        # KL for this chunk
+        chunk_teacher_probs = teacher_probs[:, start:end, :]  # [B, C, K]
+        chunk_kl = F.kl_div(chunk_log_probs, chunk_teacher_probs, reduction='none').sum(dim=-1)  # [B, C]
+        
+        # Mask and accumulate
+        chunk_mask = attention_mask[:, start:end].float()  # [B, C]
+        total_kl += (chunk_kl * chunk_mask).sum()
+        total_tokens += chunk_mask.sum()
+        
+        # Free memory immediately
+        del chunk_log_probs_full
     
-    return loss
+    return total_kl / (total_tokens + 1e-8)
 
 
 class DistillationTrainer:
@@ -286,45 +299,46 @@ class DistillationTrainer:
             KL divergence loss (scalar)
         """
         L, V = student_logits.shape
-        K = teacher_values.shape[-1]
-        
-        # Apply temperature
         temperature = self.config.temperature
         
-        # CRITICAL: Apply log_softmax over FULL vocab BEFORE gathering!
-        # This ensures the normalization constant is correct.
-        # Previous bug: log_softmax(gathered) uses wrong normalization over K values
-        student_log_probs_full = F.log_softmax(student_logits / temperature, dim=-1)  # [L, V]
-        student_log_probs = torch.gather(student_log_probs_full, dim=-1, index=teacher_indices)  # [L, K]
+        # CHUNKED COMPUTATION to avoid OOM at 131K context
+        # Full [L, V] log_softmax = L × 152K × 2 bytes = 1.2GB at 8K, 19GB at 131K
+        # Chunked: only 1024 × 152K × 2 = 310MB at a time
+        chunk_size = 1024
         
-        # Teacher: convert to probabilities based on format
-        if teacher_format == "logits":
-            # Raw logits: apply softmax with temperature
-            teacher_probs = F.softmax(teacher_values / temperature, dim=-1)  # [L, K]
-        else:
-            # Log-probs from vLLM: exponentiate and renormalize
-            # WARNING: Temperature scaling of log-probs is mathematically approximate
-            if temperature != 1.0:
-                import warnings
-                warnings.warn(
-                    f"Temperature={temperature} with cached vLLM log-probs is approximate. "
-                    "For accurate temperature scaling, cache raw logits instead.",
-                    UserWarning,
-                )
-            teacher_probs = torch.exp(teacher_values)  # [L, K]
-            teacher_probs = teacher_probs / teacher_probs.sum(dim=-1, keepdim=True)  # Renormalize
+        total_kl = 0.0
+        total_tokens = 0.0
         
-        # Compute KL divergence per position: sum_k P(k) * [log P(k) - log Q(k)]
-        kl_per_pos = F.kl_div(student_log_probs, teacher_probs, reduction='none').sum(dim=-1)  # [L]
+        for start in range(0, L, chunk_size):
+            end = min(start + chunk_size, L)
+            
+            # Only materialize [chunk_size, V] - much smaller!
+            chunk_logits = student_logits[start:end]  # [C, V]
+            chunk_log_probs_full = F.log_softmax(chunk_logits / temperature, dim=-1)  # [C, V]
+            chunk_log_probs = torch.gather(
+                chunk_log_probs_full, dim=-1, index=teacher_indices[start:end]
+            )  # [C, K]
+            
+            # Teacher probs for this chunk
+            chunk_teacher_values = teacher_values[start:end]  # [C, K]
+            if teacher_format == "logits":
+                chunk_teacher_probs = F.softmax(chunk_teacher_values / temperature, dim=-1)
+            else:
+                chunk_teacher_probs = torch.exp(chunk_teacher_values)
+                chunk_teacher_probs = chunk_teacher_probs / chunk_teacher_probs.sum(dim=-1, keepdim=True)
+            
+            # KL for this chunk
+            chunk_kl = F.kl_div(chunk_log_probs, chunk_teacher_probs, reduction='none').sum(dim=-1)  # [C]
+            
+            # Mask and accumulate
+            chunk_mask = attention_mask[start:end].float()
+            total_kl += (chunk_kl * chunk_mask).sum()
+            total_tokens += chunk_mask.sum()
+            
+            # Free memory immediately
+            del chunk_log_probs_full
         
-        # Apply attention mask
-        mask = attention_mask.float()
-        masked_kl = kl_per_pos * mask
-        
-        # Average over non-masked positions
-        loss = masked_kl.sum() / (mask.sum() + 1e-8)
-        
-        return loss
+        return total_kl / (total_tokens + 1e-8)
 
     def _compute_batched_sparse_kl_loss(
         self,
@@ -335,7 +349,10 @@ class DistillationTrainer:
         teacher_format: str = "logprobs",
     ) -> torch.Tensor:
         """
-        Compute KL divergence for a full batch at once.
+        Compute KL divergence for a full batch using chunked computation.
+        
+        CHUNKED to avoid OOM: Full [B, L, V] at 131K = 8×131K×152K×2 = 318GB!
+        Chunked: [B, 1024, V] = 8×1024×152K×2 = 2.4GB per chunk.
         
         Args:
             student_logits: [B, L, V] - Full student logits
@@ -347,35 +364,43 @@ class DistillationTrainer:
         Returns:
             KL divergence loss (scalar, averaged over all valid positions in batch)
         """
+        B, L, V = student_logits.shape
         temperature = self.config.temperature
+        chunk_size = 1024
         
-        # Full-vocab log_softmax, then gather at teacher indices
-        student_log_probs_full = F.log_softmax(student_logits / temperature, dim=-1)  # [B, L, V]
-        student_log_probs = torch.gather(student_log_probs_full, dim=-1, index=teacher_indices)  # [B, L, K]
+        total_kl = 0.0
+        total_tokens = 0.0
         
-        # Teacher probabilities
-        if teacher_format == "logits":
-            teacher_probs = F.softmax(teacher_values / temperature, dim=-1)  # [B, L, K]
-        else:
-            if temperature != 1.0:
-                import warnings
-                warnings.warn(
-                    f"Temperature={temperature} with cached vLLM log-probs is approximate. "
-                    "For accurate temperature scaling, cache raw logits instead.",
-                    UserWarning,
-                )
-            teacher_probs = torch.exp(teacher_values)  # [B, L, K]
-            teacher_probs = teacher_probs / teacher_probs.sum(dim=-1, keepdim=True)
+        for start in range(0, L, chunk_size):
+            end = min(start + chunk_size, L)
+            
+            # Only materialize [B, chunk, V] - 2.4GB instead of 318GB
+            chunk_logits = student_logits[:, start:end, :]  # [B, C, V]
+            chunk_log_probs_full = F.log_softmax(chunk_logits / temperature, dim=-1)  # [B, C, V]
+            chunk_log_probs = torch.gather(
+                chunk_log_probs_full, dim=-1, index=teacher_indices[:, start:end, :]
+            )  # [B, C, K]
+            
+            # Teacher probs for this chunk
+            chunk_teacher_values = teacher_values[:, start:end, :]  # [B, C, K]
+            if teacher_format == "logits":
+                chunk_teacher_probs = F.softmax(chunk_teacher_values / temperature, dim=-1)
+            else:
+                chunk_teacher_probs = torch.exp(chunk_teacher_values)
+                chunk_teacher_probs = chunk_teacher_probs / chunk_teacher_probs.sum(dim=-1, keepdim=True)
+            
+            # KL for this chunk
+            chunk_kl = F.kl_div(chunk_log_probs, chunk_teacher_probs, reduction='none').sum(dim=-1)  # [B, C]
+            
+            # Mask and accumulate
+            chunk_mask = attention_mask[:, start:end].float()  # [B, C]
+            total_kl += (chunk_kl * chunk_mask).sum()
+            total_tokens += chunk_mask.sum()
+            
+            # Free memory immediately
+            del chunk_log_probs_full
         
-        # KL per position
-        kl_per_pos = F.kl_div(student_log_probs, teacher_probs, reduction='none').sum(dim=-1)  # [B, L]
-        
-        # Mask and average over all valid positions across the batch
-        mask = attention_mask.float()  # [B, L]
-        masked_kl = kl_per_pos * mask
-        loss = masked_kl.sum() / (mask.sum() + 1e-8)
-        
-        return loss
+        return total_kl / (total_tokens + 1e-8)
     
     def train_step(
         self,
