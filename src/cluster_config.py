@@ -155,15 +155,19 @@ def setup_fsdp_student(
     - Gradients
     
     This allows training larger models than would fit on a single GPU.
+    
+    NOTE: Currently the training loop uses device_map="auto" (Accelerate-style)
+    for the frozen student since it only does forward passes. FSDP wrapping is
+    only needed if you want gradient-sharded training of the student weights.
+    This function is provided for future use when unfreezing student layers.
     """
     from torch.distributed.fsdp import (
         FullyShardedDataParallel as FSDP,
         MixedPrecision,
         ShardingStrategy,
     )
-    from torch.distributed.fsdp.wrap import (
-        transformer_auto_wrap_policy,
-    )
+    from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+    from functools import partial
     
     # Set up mixed precision policy
     bf16_policy = MixedPrecision(
@@ -172,15 +176,27 @@ def setup_fsdp_student(
         buffer_dtype=torch.bfloat16,
     )
     
-    # Wrap with FSDP
-    # Note: The actual wrapping depends on the model architecture
-    # This is a template that needs to be customized for Qwen3
+    # Auto-wrap at the decoder layer level for proper sharding granularity.
+    # The actual layer class must match the model architecture.
+    # For Qwen3 models, this is typically the decoder layer class.
+    # TODO: Detect the correct layer class from the model automatically.
+    wrap_policy = None
+    for name, module in model.named_modules():
+        # Heuristic: find the repeated decoder layer class
+        if hasattr(module, "self_attn") and hasattr(module, "mlp"):
+            wrap_policy = partial(
+                transformer_auto_wrap_policy,
+                transformer_layer_cls={type(module)},
+            )
+            break
+    
     fsdp_model = FSDP(
         model,
         sharding_strategy=ShardingStrategy.FULL_SHARD,
         mixed_precision=bf16_policy,
         device_id=torch.cuda.current_device(),
         use_orig_params=True,  # Required for gradient checkpointing
+        auto_wrap_policy=wrap_policy,
     )
     
     return fsdp_model
@@ -203,88 +219,6 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
-class ProducerConsumerPipeline:
-    """
-    Async pipeline for overlapping Teacher inference with Student training.
-    
-    Producer (GPUs 0-3): Continuously runs Teacher forward passes
-    Consumer (GPUs 4-7): Trains on the produced logits
-    
-    Communication via a shared queue (CPU memory or CUDA IPC).
-    """
-    
-    def __init__(
-        self,
-        queue_size: int = 32,
-        use_cuda_ipc: bool = False,
-        max_prompt_tokens: int = 512,
-    ):
-        import queue
-        import threading
-        
-        self.queue = queue.Queue(maxsize=queue_size)
-        self.use_cuda_ipc = use_cuda_ipc
-        self.max_prompt_tokens = max_prompt_tokens
-        self._stop_event = threading.Event()
-        
-    def producer_loop(self, teacher, dataloader, top_k: int = 128):
-        """
-        Producer thread: Generate Teacher logits.
-        
-        Runs on GPUs 0-3. Converts dense logits to sparse top-k format
-        to match what train_step expects.
-        """
-        for batch in dataloader:
-            if self._stop_event.is_set():
-                break
-                
-            with torch.no_grad():
-                teacher_logits = teacher(batch["input_ids"]).logits  # [B, L, V]
-                
-                # Convert to sparse top-k format (matches cached teacher format)
-                teacher_values, teacher_indices = torch.topk(teacher_logits, top_k, dim=-1)
-                
-                # Move to CPU to decouple from Teacher GPUs
-                if not self.use_cuda_ipc:
-                    teacher_values = teacher_values.cpu()
-                    teacher_indices = teacher_indices.cpu()
-            
-            # Put in queue with keys matching train_step expectations
-            max_len = self.max_prompt_tokens
-            self.queue.put({
-                "input_ids": batch["input_ids"],
-                "attention_mask": batch["attention_mask"],
-                "prompt_ids": batch.get("prompt_ids", batch["input_ids"][:, :max_len]),
-                "prompt_mask": batch.get("prompt_mask", batch["attention_mask"][:, :max_len]),
-                "teacher_values": teacher_values,    # Sparse format
-                "teacher_indices": teacher_indices,  # Sparse format
-                "teacher_format": "logits",          # These are raw logits, not log-probs
-            })
-    
-    def consumer_loop(self, trainer, num_steps: int):
-        """
-        Consumer thread: Train on the logits.
-        
-        Runs on GPUs 4-7.
-        """
-        for _ in range(num_steps):
-            if self._stop_event.is_set():
-                break
-                
-            # Get from queue (blocks if empty)
-            batch = self.queue.get()
-            
-            # Move Teacher logits to training device
-            if not self.use_cuda_ipc:
-                batch["teacher_values"] = batch["teacher_values"].cuda()
-                batch["teacher_indices"] = batch["teacher_indices"].cuda()
-            
-            # Train step
-            trainer.train_step(batch)
-    
-    def stop(self):
-        """Signal both threads to stop."""
-        self._stop_event.set()
 
 
 if __name__ == "__main__":

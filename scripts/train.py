@@ -37,26 +37,43 @@ def load_config(config_path: str) -> TrainingConfig:
     with open(config_path) as f:
         config_dict = yaml.safe_load(f)
     
-    # Flatten nested config sections
+    # Flatten nested config sections with explicit key mapping
     flat_config = {}
-    section_mapping = {
-        "teacher": {"model_id": "teacher_model_id"},
-        "student": {"model_id": "student_model_id"},
-        "hypernetwork": {},
-        "data": {},
-        "training": {},
-        "checkpointing": {"save_dir": "save_dir", "save_every_epochs": "save_every_epochs"},
-        "logging": {"wandb_project": "wandb_project", "log_every_steps": "log_every_steps"},
+    
+    # Maps YAML section.key -> TrainingConfig field name
+    # Keys not listed here fall through as-is if they match a TrainingConfig field
+    key_mapping = {
+        # teacher section
+        "teacher.model_id": "teacher_model_id",
+        # student section
+        "student.model_id": "student_model_id",
+        # hypernetwork section
+        "hypernetwork.num_layers": "num_encoder_layers",
+        # checkpointing section
+        "checkpointing.save_dir": "save_dir",
+        "checkpointing.save_every_epochs": "save_every_epochs",
+        # logging section
+        "logging.wandb_project": "wandb_project",
+        "logging.wandb_run_name": "wandb_run_name",
+        "logging.wandb_enabled": "wandb_enabled",
+        "logging.log_every_steps": "log_every_steps",
     }
+    
+    dropped_keys = []
     
     for section, values in config_dict.items():
         if isinstance(values, dict):
-            mapping = section_mapping.get(section, {})
             for key, value in values.items():
-                # Use mapping if exists, otherwise use key directly
-                target_key = mapping.get(key, key)
+                qualified = f"{section}.{key}"
+                # Check explicit mapping first, then try key as-is
+                target_key = key_mapping.get(qualified, key)
                 if hasattr(TrainingConfig, target_key):
                     flat_config[target_key] = value
+                else:
+                    dropped_keys.append(qualified)
+    
+    if dropped_keys:
+        logger.warning(f"YAML keys not mapped to TrainingConfig (ignored): {dropped_keys}")
     
     return TrainingConfig(**flat_config)
 

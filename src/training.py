@@ -49,14 +49,15 @@ class TrainingConfig:
     num_heads: int = 8
     lora_rank: int = 16
     lora_alpha: int = 32
+    dropout: float = 0.1
     
     # Training
     learning_rate: float = 1e-4
     warmup_lr: float = 1e-5
     epochs: int = 20
     warmup_epochs: int = 2
-    batch_size: int = 4
-    gradient_accumulation_steps: int = 2
+    batch_size: int = 1  # Keep at 1 to avoid sequential per-sample LoRA overhead
+    gradient_accumulation_steps: int = 8  # Effective batch size = 8
     max_grad_norm: float = 1.0
     weight_decay: float = 0.01
     
@@ -74,6 +75,7 @@ class TrainingConfig:
     
     # Logging
     wandb_project: str = "hypernetwork-distillation"
+    wandb_run_name: str = ""
     wandb_enabled: bool = True
     log_every_steps: int = 10
     
@@ -81,8 +83,9 @@ class TrainingConfig:
     use_cached_teacher: bool = True
     teacher_cache_dir: str = "./teacher_cache"
     
-    # Performance optimization
-    use_parallel_step: bool = True  # Use torch.compile optimized step
+    # Validation
+    val_split: float = 0.05  # Hold out 5% for validation
+    val_every_epochs: int = 1  # Evaluate every N epochs
 
 
 
@@ -150,7 +153,6 @@ class DistillationTrainer:
         self.tokenizer = None
         self.optimizer = None
         self.scheduler = None
-        self.scaler = None
         
     def setup(self):
         """Initialize all components."""
@@ -242,17 +244,8 @@ class DistillationTrainer:
             weight_decay=self.config.weight_decay,
         )
         # Note: GradScaler is NOT needed for bfloat16 (same exponent range as fp32)
-        
-        # Pre-compile forward function for train_step_parallel (saves 30s per step!)
-        self._compiled_forward = None
-        try:
-            self._compiled_forward = torch.compile(
-                self._single_sample_forward, 
-                mode="reduce-overhead"
-            )
-            logger.info("torch.compile: Enabled (reduce-overhead mode)")
-        except Exception as e:
-            logger.warning(f"torch.compile not available: {e}")
+        # Note: torch.compile is NOT used because dynamic hook registration/removal
+        # in apply_lora is incompatible with graph tracing (stale CUDA graphs).
         
         logger.info("Setup complete!")
         
@@ -435,19 +428,12 @@ class DistillationTrainer:
         batch: Dict[str, torch.Tensor],
     ) -> Dict[str, float]:
         """
-        Optimized training step using parallel forward passes.
+        Training step with loss stacking for single backward pass.
         
-        NOTE: Despite the name, per-sample LoRA application is still sequential
-        due to the need to apply different LoRA weights per sample. The 'parallel'
-        refers to potential future batched einsum optimization, not current impl.
-        True batched LoRA would require fundamentally different architecture.
-        
-        Current optimizations:
-        - Pre-compiled forward function via torch.compile
-        - Loss stacking for single backward pass
+        NOTE: Per-sample LoRA application is sequential due to needing different
+        LoRA weights per sample. To avoid wasting GPU cycles, keep batch_size=1
+        and use gradient_accumulation_steps for effective batch size.
         """
-        import torch.utils.checkpoint as checkpoint
-        
         # Move batch to device
         input_ids = batch["input_ids"].to(self.device)
         attention_mask = batch["attention_mask"].to(self.device)
@@ -476,15 +462,11 @@ class DistillationTrainer:
         
         batch_size = input_ids.shape[0]
         
-        # Process in parallel using Python threads for I/O bound parts
-        # The actual compute happens on GPU so this overlaps nicely
         losses = []
         
-        # Use pre-compiled forward function (compiled during setup, NOT here!)
-        forward_fn = self._compiled_forward or self._single_sample_forward
         
         for b in range(batch_size):
-            loss = forward_fn(
+            loss = self._single_sample_forward(
                 b, lora_output, input_ids, attention_mask,
                 teacher_values if has_cached_teacher else None,
                 teacher_indices if has_cached_teacher else None,
@@ -515,7 +497,7 @@ class DistillationTrainer:
         has_cached_teacher: bool,
         teacher_format: str = "logprobs",
     ) -> torch.Tensor:
-        """Process a single sample - separated for potential torch.compile."""
+        """Process a single sample with its own LoRA weights."""
         lora_dict = self.hypernetwork.get_lora_dict(lora_output, batch_idx=batch_idx)
         
         # Use autocast for mixed precision (bfloat16 on H200)
@@ -560,11 +542,7 @@ class DistillationTrainer:
         num_steps = 0
         
         for step, batch in enumerate(dataloader):
-            # Use optimized parallel step or sequential step
-            if self.config.use_parallel_step:
-                metrics = self.train_step_parallel(batch)
-            else:
-                metrics = self.train_step(batch)
+            metrics = self.train_step_parallel(batch)
             total_loss += metrics["loss"]
             num_steps += 1
             
@@ -596,6 +574,82 @@ class DistillationTrainer:
                         })
         
         return {"avg_loss": total_loss / max(num_steps, 1)}
+    
+    @torch.no_grad()
+    def validate(
+        self,
+        dataloader,
+    ) -> Dict[str, float]:
+        """Run validation and return metrics."""
+        self.hypernetwork.eval()
+        
+        total_loss = 0.0
+        num_steps = 0
+        
+        for batch in dataloader:
+            input_ids = batch["input_ids"].to(self.device)
+            attention_mask = batch["attention_mask"].to(self.device)
+            prompt_ids = batch["prompt_ids"].to(self.device)
+            prompt_mask = batch["prompt_mask"].to(self.device)
+            
+            has_cached_teacher = (
+                self.config.use_cached_teacher
+                and "teacher_values" in batch
+                and "teacher_indices" in batch
+            )
+            
+            if has_cached_teacher:
+                teacher_values = batch["teacher_values"].to(self.device)
+                teacher_indices = batch["teacher_indices"].to(self.device)
+                teacher_format = batch.get("teacher_format", "logprobs")
+            
+            prompt_embeds = self.get_student_embeddings(prompt_ids)
+            lora_output = self.hypernetwork(prompt_embeds, prompt_mask)
+            
+            batch_size = input_ids.shape[0]
+            batch_loss = 0.0
+            
+            for b in range(batch_size):
+                lora_dict = self.hypernetwork.get_lora_dict(lora_output, batch_idx=b)
+                
+                with self.lora_injector.apply_lora(lora_dict), autocast("cuda", dtype=torch.bfloat16):
+                    student_outputs = self.student(
+                        input_ids=input_ids[b:b+1],
+                        attention_mask=attention_mask[b:b+1],
+                    )
+                    student_logits = student_outputs.logits
+                
+                if has_cached_teacher:
+                    loss = self._compute_sparse_kl_loss(
+                        student_logits[0],
+                        teacher_values[b],
+                        teacher_indices[b],
+                        attention_mask[b],
+                        teacher_format=teacher_format,
+                    )
+                else:
+                    teacher_outputs = self.teacher(
+                        input_ids=input_ids[b:b+1],
+                        attention_mask=attention_mask[b:b+1],
+                    )
+                    loss = compute_distillation_loss(
+                        student_logits,
+                        teacher_outputs.logits,
+                        attention_mask[b:b+1],
+                        top_k=self.config.top_k_logits,
+                        temperature=self.config.temperature,
+                    )
+                batch_loss += loss.item()
+            
+            total_loss += batch_loss / batch_size
+            num_steps += 1
+        
+        self.hypernetwork.train()
+        
+        avg_val_loss = total_loss / max(num_steps, 1)
+        logger.info(f"Validation Loss: {avg_val_loss:.4f}")
+        
+        return {"val_loss": avg_val_loss}
     
     def save_checkpoint(self, epoch: int, path: str):
         """Save training checkpoint including scheduler state."""
@@ -638,17 +692,52 @@ class DistillationTrainer:
         else:
             wandb.init(mode="disabled")
         
-        # Create dataloader
-        dataloader = create_dataloader(
+        # Create full dataloader (shuffle=False for splitting)
+        full_dataloader = create_dataloader(
             tokenizer=self.tokenizer,
             batch_size=self.config.batch_size,
             max_prompt_tokens=self.config.max_prompt_tokens,
             max_trajectory_tokens=self.config.max_trajectory_tokens,
             teacher_cache_dir=self.config.teacher_cache_dir if self.config.use_cached_teacher else None,
+            shuffle=False,
+        )
+        
+        # Split into train/val
+        full_dataset = full_dataloader.dataset
+        val_size = max(1, int(len(full_dataset) * self.config.val_split))
+        train_size = len(full_dataset) - val_size
+        
+        train_dataset, val_dataset = torch.utils.data.random_split(
+            full_dataset, [train_size, val_size],
+            generator=torch.Generator().manual_seed(42),
+        )
+        logger.info(f"Dataset split: {train_size} train, {val_size} val")
+        
+        pad_token_id = self.tokenizer.pad_token_id or 0
+        from .data_loader import collate_fn_with_teacher
+        collate_fn = lambda batch: collate_fn_with_teacher(
+            batch, pad_token_id, self.config.max_trajectory_tokens,
+        )
+        
+        train_dataloader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=self.config.batch_size,
+            shuffle=True,
+            num_workers=4,
+            collate_fn=collate_fn,
+            pin_memory=True,
+        )
+        val_dataloader = torch.utils.data.DataLoader(
+            val_dataset,
+            batch_size=self.config.batch_size,
+            shuffle=False,
+            num_workers=2,
+            collate_fn=collate_fn,
+            pin_memory=True,
         )
         
         # Setup scheduler: warmup → cosine decay
-        steps_per_epoch = len(dataloader) // self.config.gradient_accumulation_steps
+        steps_per_epoch = len(train_dataloader) // self.config.gradient_accumulation_steps
         warmup_steps = self.config.warmup_epochs * steps_per_epoch
         total_steps = self.config.epochs * steps_per_epoch
         
@@ -670,15 +759,29 @@ class DistillationTrainer:
         )
         
         # Training loop
+        best_val_loss = float("inf")
+        
         for epoch in range(self.config.epochs):
             
             logger.info(f"\n=== Epoch {epoch + 1}/{self.config.epochs} ===")
             
-            metrics = self.train_epoch(dataloader, epoch)
+            metrics = self.train_epoch(train_dataloader, epoch)
             
             logger.info(f"Epoch {epoch + 1} complete. Avg Loss: {metrics['avg_loss']:.4f}")
             
-            # Save checkpoint
+            # Validation
+            if (epoch + 1) % self.config.val_every_epochs == 0:
+                val_metrics = self.validate(val_dataloader)
+                if wandb.run:
+                    wandb.log({"val_loss": val_metrics["val_loss"], "epoch": epoch + 1})
+                
+                if val_metrics["val_loss"] < best_val_loss:
+                    best_val_loss = val_metrics["val_loss"]
+                    best_path = Path(self.config.save_dir) / "best.pt"
+                    self.save_checkpoint(epoch + 1, str(best_path))
+                    logger.info(f"New best val loss: {best_val_loss:.4f}")
+            
+            # Save periodic checkpoint
             if (epoch + 1) % self.config.save_every_epochs == 0:
                 ckpt_path = Path(self.config.save_dir) / f"epoch_{epoch+1}.pt"
                 self.save_checkpoint(epoch + 1, str(ckpt_path))
