@@ -124,35 +124,57 @@ class PromptEncoder(nn.Module):
         return context
 
 
-class UnifiedLoRAGenerator(nn.Module):
+class ShapeGroupedLoRAGenerator(nn.Module):
     """
-    Single generator for ALL layers.
+    LoRA generator with per-shape output heads.
     
-    Uses layer + module embeddings to produce different LoRAs
-    for each (layer, module) combination.
+    For Qwen3-Coder-Next, handles 4 unique (in_features, out_features) shapes:
+    - (2048, 2048): DeltaNet q_proj, k_proj
+    - (2048, 4096): DeltaNet v_proj, Attention q_proj
+    - (4096, 2048): DeltaNet o_proj, Attention o_proj
+    - (2048, 512): Attention k_proj, v_proj
+    
+    Architecture:
+    1. Shared backbone: context + layer_embedding -> features
+    2. Per-shape output heads: features -> (lora_A, lora_B) with correct dims
     """
     
     def __init__(
         self,
         context_dim: int = 2048,
-        hidden_dim: int = 2048,
         lora_rank: int = 16,
-        num_layers: int = 48,
-        num_modules: int = 4,  # q, k, v, o
+        layer_shapes: List[Tuple[str, int, int]] = None,  # [(name, in_feat, out_feat), ...]
         zero_init: bool = True,
     ):
+        """
+        Args:
+            context_dim: Dimension of context vector from prompt encoder
+            lora_rank: Rank of LoRA matrices
+            layer_shapes: List of (layer_name, in_features, out_features) for each target
+            zero_init: Initialize B heads to zero for stable training start
+        """
         super().__init__()
         self.context_dim = context_dim
-        self.hidden_dim = hidden_dim
         self.lora_rank = lora_rank
-        self.num_layers = num_layers
-        self.num_modules = num_modules
         
-        # Learnable embeddings
-        self.layer_embed = nn.Embedding(num_layers, context_dim)
-        self.module_embed = nn.Embedding(num_modules, context_dim)
+        if layer_shapes is None:
+            raise ValueError("layer_shapes must be provided (from discover_target_layers)")
         
-        # Shared generator network
+        # Store layer info
+        self.num_layers = len(layer_shapes)
+        self.layer_names = [ls[0] if isinstance(ls, (tuple, list)) else ls.name for ls in layer_shapes]
+        self.layer_shapes = [(ls[1], ls[2]) if isinstance(ls, (tuple, list)) else (ls.in_features, ls.out_features) for ls in layer_shapes]
+        
+        # Identify unique shapes and create mapping
+        unique_shapes = list(set(self.layer_shapes))
+        self.unique_shapes = unique_shapes
+        self.shape_to_idx = {shape: i for i, shape in enumerate(unique_shapes)}
+        self.layer_to_shape_idx = [self.shape_to_idx[s] for s in self.layer_shapes]
+        
+        # Learnable layer embeddings (one per target layer)
+        self.layer_embed = nn.Embedding(self.num_layers, context_dim)
+        
+        # Shared generator backbone
         self.generator = nn.Sequential(
             nn.Linear(context_dim * 2, context_dim),
             nn.GELU(),
@@ -162,71 +184,117 @@ class UnifiedLoRAGenerator(nn.Module):
             nn.LayerNorm(context_dim),
         )
         
-        # Output heads for A and B matrices
-        self.head_A = nn.Linear(context_dim, hidden_dim * lora_rank)
-        self.head_B = nn.Linear(context_dim, lora_rank * hidden_dim)
+        # Per-shape output heads
+        self.heads_A = nn.ModuleDict()
+        self.heads_B = nn.ModuleDict()
         
-        # Zero initialization for stability
-        if zero_init:
-            nn.init.zeros_(self.head_B.weight)
-            nn.init.zeros_(self.head_B.bias)
-            nn.init.normal_(self.head_A.weight, std=0.01)
-            nn.init.zeros_(self.head_A.bias)
+        for in_dim, out_dim in unique_shapes:
+            shape_key = f"{in_dim}_{out_dim}"
+            # A: projects input (in_dim) down to rank
+            self.heads_A[shape_key] = nn.Linear(context_dim, in_dim * lora_rank)
+            # B: projects rank up to output (out_dim)
+            self.heads_B[shape_key] = nn.Linear(context_dim, lora_rank * out_dim)
+            
+            if zero_init:
+                nn.init.zeros_(self.heads_B[shape_key].weight)
+                nn.init.zeros_(self.heads_B[shape_key].bias)
+                nn.init.normal_(self.heads_A[shape_key].weight, std=0.01)
+                nn.init.zeros_(self.heads_A[shape_key].bias)
+        
+        # Pre-compute shape keys for efficiency
+        self._shape_keys = [f"{s[0]}_{s[1]}" for s in self.layer_shapes]
     
     def forward(
         self,
         context: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Generate LoRA matrices for ALL layers and modules.
+        Generate LoRA matrices for all layers.
         
         Args:
             context: [B, D] - Context from prompt encoder
             
         Returns:
-            lora_A: [B, num_layers * num_modules, hidden_dim, rank]
-            lora_B: [B, num_layers * num_modules, rank, hidden_dim]
+            Dict mapping layer_name -> (lora_A, lora_B)
+            where lora_A: [B, in_features, rank]
+                  lora_B: [B, rank, out_features]
         """
         B = context.shape[0]
         device = context.device
         
-        # Create indices for all (layer, module) combinations
-        # Total: num_layers * num_modules
-        layer_indices = torch.arange(self.num_layers, device=device).repeat_interleave(self.num_modules)
-        module_indices = torch.arange(self.num_modules, device=device).repeat(self.num_layers)
-        
-        N = layer_indices.shape[0]  # num_layers * num_modules
-        
-        # Get embeddings
+        # Get all layer embeddings
+        layer_indices = torch.arange(self.num_layers, device=device)
         layer_emb = self.layer_embed(layer_indices)  # [N, D]
-        module_emb = self.module_embed(module_indices)  # [N, D]
-        combined_emb = layer_emb + module_emb  # [N, D]
         
-        # Expand for batch
-        context_expanded = context.unsqueeze(1).expand(-1, N, -1)  # [B, N, D]
-        combined_emb = combined_emb.unsqueeze(0).expand(B, -1, -1)  # [B, N, D]
+        # Expand context for all layers
+        context_expanded = context.unsqueeze(1).expand(-1, self.num_layers, -1)  # [B, N, D]
+        layer_emb_expanded = layer_emb.unsqueeze(0).expand(B, -1, -1)  # [B, N, D]
         
-        # Generate
-        generator_input = torch.cat([context_expanded, combined_emb], dim=-1)
-        features = self.generator(generator_input)
+        # Generate features through shared backbone
+        generator_input = torch.cat([context_expanded, layer_emb_expanded], dim=-1)  # [B, N, 2D]
+        features = self.generator(generator_input)  # [B, N, D]
         
-        lora_A_flat = self.head_A(features)
-        lora_B_flat = self.head_B(features)
+        # Apply per-shape heads
+        result = {}
+        for i, layer_name in enumerate(self.layer_names):
+            shape_key = self._shape_keys[i]
+            in_dim, out_dim = self.layer_shapes[i]
+            
+            feat = features[:, i, :]  # [B, D]
+            
+            lora_A_flat = self.heads_A[shape_key](feat)  # [B, in_dim * rank]
+            lora_B_flat = self.heads_B[shape_key](feat)  # [B, rank * out_dim]
+            
+            lora_A = lora_A_flat.view(B, in_dim, self.lora_rank)  # [B, in_dim, rank]
+            lora_B = lora_B_flat.view(B, self.lora_rank, out_dim)  # [B, rank, out_dim]
+            
+            result[layer_name] = (lora_A, lora_B)
         
-        lora_A = rearrange(lora_A_flat, 'b n (h r) -> b n h r', r=self.lora_rank)
-        lora_B = rearrange(lora_B_flat, 'b n (r h) -> b n r h', r=self.lora_rank)
+        return result
+
+
+# Keep old class for backwards compatibility
+class UnifiedLoRAGenerator(ShapeGroupedLoRAGenerator):
+    """Legacy alias - use ShapeGroupedLoRAGenerator instead."""
+    
+    def __init__(
+        self,
+        context_dim: int = 2048,
+        hidden_dim: int = 2048,
+        lora_rank: int = 16,
+        num_layers: int = 48,
+        num_modules: int = 4,
+        zero_init: bool = True,
+    ):
+        # Create mock layer shapes with uniform dimensions (legacy behavior)
+        import warnings
+        warnings.warn(
+            "UnifiedLoRAGenerator is deprecated - it uses uniform dimensions which "
+            "is incorrect for Qwen3-Coder-Next. Use ShapeGroupedLoRAGenerator instead.",
+            DeprecationWarning,
+        )
         
-        return lora_A, lora_B
+        layer_shapes = [
+            (f"layer_{i}_module_{j}", hidden_dim, hidden_dim)
+            for i in range(num_layers)
+            for j in range(num_modules)
+        ]
+        super().__init__(
+            context_dim=context_dim,
+            lora_rank=lora_rank,
+            layer_shapes=layer_shapes,
+            zero_init=zero_init,
+        )
 
 
 class AgenticHyperNetwork(nn.Module):
     """
     Main Hypernetwork that generates dynamic LoRA adapters.
     
-    v3 Fixes:
-    - Uses DISCOVERED layer names, not template-based guessing
-    - Guarantees correct mapping for both Attention AND DeltaNet layers
-    - Single unified generator for all layers
+    v4 Fixes:
+    - Uses ShapeGroupedLoRAGenerator with per-shape output heads
+    - Handles varying (in_features, out_features) for DeltaNet/Attention layers
+    - Supports Qwen3-Coder-Next's hybrid Gated DeltaNet + Gated Attention architecture
     """
     
     def __init__(
@@ -236,14 +304,13 @@ class AgenticHyperNetwork(nn.Module):
         num_heads: int = 8,
         lora_config: Optional[LoRAConfig] = None,
         dropout: float = 0.1,
-        # CRITICAL: Pass actual discovered layer names
-        target_layer_names: Optional[List[str]] = None,
+        # CRITICAL: Pass LayerInfo list with dimensions
+        target_layer_names: Optional[List] = None,  # List[LayerInfo] or List[str]
     ):
         super().__init__()
         
         self.lora_config = lora_config or LoRAConfig()
         self.hidden_dim = hidden_dim
-        self.target_layer_names = target_layer_names  # e.g., ["model.layers.0.self_attn.q_proj", ...]
         
         # Prompt encoder
         self.prompt_encoder = PromptEncoder(
@@ -253,21 +320,47 @@ class AgenticHyperNetwork(nn.Module):
             dropout=dropout,
         )
         
-        # Determine number of LoRAs to generate
-        if target_layer_names is not None:
-            num_loras = len(target_layer_names)
+        # Process target_layer_names to extract shapes
+        if target_layer_names is None:
+            raise ValueError(
+                "target_layer_names must be provided (from discover_target_layers). "
+                "This ensures LoRA matrices have correct dimensions for each layer."
+            )
+        
+        # Handle both LayerInfo and plain strings (for backwards compat)
+        if len(target_layer_names) > 0:
+            first = target_layer_names[0]
+            if hasattr(first, 'in_features'):
+                # It's LayerInfo
+                self.layer_shapes = target_layer_names
+                self.target_layer_names = [li.name for li in target_layer_names]
+            elif isinstance(first, (tuple, list)) and len(first) == 3:
+                # It's (name, in_features, out_features) tuple
+                self.layer_shapes = target_layer_names
+                self.target_layer_names = [t[0] for t in target_layer_names]
+            else:
+                # Plain strings - fallback to uniform dimensions (legacy)
+                import warnings
+                warnings.warn(
+                    "target_layer_names contains plain strings without dimensions. "
+                    "This may cause dimension mismatches. Use discover_target_layers() "
+                    "with return_dimensions=True for correct shapes.",
+                    DeprecationWarning,
+                )
+                self.target_layer_names = target_layer_names
+                self.layer_shapes = [
+                    (name, hidden_dim, hidden_dim) for name in target_layer_names
+                ]
         else:
-            num_loras = self.lora_config.num_layers * len(self.lora_config.target_modules)
+            raise ValueError("target_layer_names cannot be empty")
         
-        self.num_loras = num_loras
+        self.num_loras = len(self.layer_shapes)
         
-        # Single unified generator - sized to match discovered layers
-        self.lora_generator = UnifiedLoRAGenerator(
+        # Shape-grouped generator with per-shape output heads
+        self.lora_generator = ShapeGroupedLoRAGenerator(
             context_dim=hidden_dim,
-            hidden_dim=hidden_dim,
             lora_rank=self.lora_config.rank,
-            num_layers=num_loras,  # One embedding per discovered layer
-            num_modules=1,  # Flatten - each layer+module is one entry
+            layer_shapes=self.layer_shapes,
             zero_init=True,
         )
         
@@ -285,30 +378,24 @@ class AgenticHyperNetwork(nn.Module):
             
         Returns:
             Dict with:
-                "lora_A": [B, num_layers * num_modules, hidden_dim, rank]
-                "lora_B": [B, num_layers * num_modules, rank, hidden_dim]
+                "lora_dict": Dict[layer_name -> (lora_A, lora_B)]
                 "context": [B, D] - For debugging
         """
         context = self.prompt_encoder(prompt_embeds, prompt_mask)
-        lora_A, lora_B = self.lora_generator(context)
+        lora_dict = self.lora_generator(context)  # Dict[name -> (A, B)]
         
         return {
-            "lora_A": lora_A,
-            "lora_B": lora_B,
+            "lora_dict": lora_dict,
             "context": context,
         }
     
     def get_lora_dict(
         self,
-        lora_output: Dict[str, torch.Tensor],
+        lora_output: Dict[str, any],
         batch_idx: int = 0,
     ) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Convert batched output to dict keyed by ACTUAL layer paths.
-        
-        CRITICAL: Uses discovered layer names (ordered mapping).
-        The i-th generated LoRA goes to the i-th discovered layer.
-        This guarantees correct mapping for BOTH Attention AND DeltaNet layers.
+        Extract LoRA dict for a single batch element.
         
         Args:
             lora_output: Output from forward()
@@ -319,35 +406,24 @@ class AgenticHyperNetwork(nn.Module):
             e.g., {"model.layers.0.self_attn.q_proj": (A, B), 
                    "model.layers.1.deltanet.q_proj": (A, B), ...}
         """
-        lora_A = lora_output["lora_A"][batch_idx]  # [N, hidden_dim, rank]
-        lora_B = lora_output["lora_B"][batch_idx]  # [N, rank, hidden_dim]
-        
-        # CRITICAL: Use actual discovered names, NOT template
-        if self.target_layer_names is None:
-            raise ValueError(
-                "target_layer_names must be provided to AgenticHyperNetwork. "
-                "Use discover_target_layers() to get the real layer names."
-            )
-        
-        if len(self.target_layer_names) != lora_A.shape[0]:
-            raise ValueError(
-                f"Mismatch: Generated {lora_A.shape[0]} LoRAs but have "
-                f"{len(self.target_layer_names)} target layers. "
-                f"This likely means the model architecture changed."
-            )
+        lora_dict = lora_output["lora_dict"]
         
         result = {}
-        for idx, name in enumerate(self.target_layer_names):
-            result[name] = (lora_A[idx], lora_B[idx])
+        for name, (lora_A, lora_B) in lora_dict.items():
+            # Extract single batch element
+            result[name] = (lora_A[batch_idx], lora_B[batch_idx])
         
         return result
     
     def get_lora_dict_batched(
         self,
-        lora_output: Dict[str, torch.Tensor],
+        lora_output: Dict[str, any],
     ) -> List[Dict[str, Tuple[torch.Tensor, torch.Tensor]]]:
         """Get LoRA dicts for all samples in batch."""
-        batch_size = lora_output["lora_A"].shape[0]
+        # Get batch size from first layer's A matrix
+        lora_dict = lora_output["lora_dict"]
+        first_name = next(iter(lora_dict.keys()))
+        batch_size = lora_dict[first_name][0].shape[0]
         return [self.get_lora_dict(lora_output, b) for b in range(batch_size)]
     
     def count_parameters(self) -> Dict[str, int]:
@@ -360,32 +436,57 @@ class AgenticHyperNetwork(nn.Module):
     
     def estimate_lora_params(self) -> int:
         """Estimate total LoRA parameters generated per forward pass."""
-        cfg = self.lora_config
-        per_lora = 2 * cfg.hidden_dim * cfg.rank  # A + B
-        return per_lora * cfg.num_layers * len(cfg.target_modules)
+        rank = self.lora_config.rank
+        total = 0
+        for (in_dim, out_dim) in set(self.lora_generator.layer_shapes):
+            count = sum(1 for s in self.lora_generator.layer_shapes if s == (in_dim, out_dim))
+            per_lora = in_dim * rank + rank * out_dim  # A + B
+            total += per_lora * count
+        return total
 
 
 def test_hypernetwork():
-    """Test the simplified hypernetwork."""
+    """Test the shape-grouped hypernetwork with Qwen3-Coder-Next shapes."""
     print("=" * 60)
-    print("Testing Simplified Hypernetwork v2")
+    print("Testing Shape-Grouped Hypernetwork v4")
     print("=" * 60)
     
     config = LoRAConfig(rank=16, alpha=32, num_layers=48, hidden_dim=2048)
     
-    # Generate mock layer names to satisfy target_layer_names requirement
-    mock_layer_names = [
-        f"model.layers.{i}.self_attn.{m}"
-        for i in range(48)
-        for m in ["q_proj", "k_proj", "v_proj", "o_proj"]
-    ]
+    # Generate realistic layer info for Qwen3-Coder-Next
+    # 36 DeltaNet layers (indices 0,1,2, 4,5,6, ...) + 12 Attention layers (indices 3, 7, 11, ...)
+    layer_shapes = []
+    for i in range(48):
+        is_attention = (i % 4 == 3)  # Every 4th layer is Attention
+        
+        if is_attention:
+            # GatedAttention: q=4096, k/v=512, o=4096->2048
+            layer_shapes.append((f"model.layers.{i}.self_attn.q_proj", 2048, 4096))
+            layer_shapes.append((f"model.layers.{i}.self_attn.k_proj", 2048, 512))
+            layer_shapes.append((f"model.layers.{i}.self_attn.v_proj", 2048, 512))
+            layer_shapes.append((f"model.layers.{i}.self_attn.o_proj", 4096, 2048))
+        else:
+            # GatedDeltaNet: q/k=2048, v=4096, o=4096->2048
+            layer_shapes.append((f"model.layers.{i}.deltanet.q_proj", 2048, 2048))
+            layer_shapes.append((f"model.layers.{i}.deltanet.k_proj", 2048, 2048))
+            layer_shapes.append((f"model.layers.{i}.deltanet.v_proj", 2048, 4096))
+            layer_shapes.append((f"model.layers.{i}.deltanet.o_proj", 4096, 2048))
+    
+    print(f"\nTotal target layers: {len(layer_shapes)}")
+    
+    # Count unique shapes
+    unique_shapes = set((s[1], s[2]) for s in layer_shapes)
+    print(f"Unique shapes: {len(unique_shapes)}")
+    for shape in sorted(unique_shapes):
+        count = sum(1 for s in layer_shapes if (s[1], s[2]) == shape)
+        print(f"  {shape}: {count} layers")
     
     hypernet = AgenticHyperNetwork(
         hidden_dim=2048,
         num_encoder_layers=4,
         num_heads=8,
         lora_config=config,
-        target_layer_names=mock_layer_names,
+        target_layer_names=layer_shapes,
     )
     
     # Parameter counts
@@ -405,25 +506,31 @@ def test_hypernetwork():
     
     output = hypernet(prompt_embeds, prompt_mask)
     
-    print(f"\nOutput shapes:")
-    print(f"  lora_A: {output['lora_A'].shape}")
-    print(f"  lora_B: {output['lora_B'].shape}")
+    print(f"\nOutput:")
+    print(f"  lora_dict: {len(output['lora_dict'])} entries")
     print(f"  context: {output['context'].shape}")
     
-    # Test dict conversion
+    # Check a sample of shapes
+    print(f"\nSample LoRA shapes:")
+    sample_keys = list(output['lora_dict'].keys())[:4]
+    for key in sample_keys:
+        A, B = output['lora_dict'][key]
+        print(f"  {key.split('.')[-1]}: A={list(A.shape)}, B={list(B.shape)}")
+    
+    # Test dict extraction
     lora_dict = hypernet.get_lora_dict(output, batch_idx=0)
-    print(f"\nLoRA dict has {len(lora_dict)} entries")
-    print(f"Sample keys: {list(lora_dict.keys())[:4]}")
+    print(f"\nExtracted LoRA dict has {len(lora_dict)} entries")
     
     # Test gradient flow
-    loss = output['lora_A'].sum() + output['lora_B'].sum()
+    loss = sum(A.sum() + B.sum() for A, B in output['lora_dict'].values())
     loss.backward()
     
     has_grad = hypernet.prompt_encoder.pool_query.grad is not None
     print(f"\nGradient flow: {'✓ PASSED' if has_grad else '✗ FAILED'}")
     
-    # Test zero-init
-    b_mean = output['lora_B'].abs().mean().item()
+    # Test zero-init (all B matrices should be near zero)
+    b_means = [B.abs().mean().item() for _, B in output['lora_dict'].values()]
+    b_mean = sum(b_means) / len(b_means)
     print(f"B matrix mean abs: {b_mean:.6f} (should be ~0)")
     
     print("\n" + "=" * 60)

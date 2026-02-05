@@ -168,19 +168,42 @@ class BatchedLoRAInjector:
         self._hook_handles = []
         self._current_lora = None
 
+# Type for layer discovery results
+from dataclasses import dataclass
+from typing import NamedTuple
+
+class LayerInfo(NamedTuple):
+    """Information about a discovered target layer."""
+    name: str
+    in_features: int
+    out_features: int
+
 
 def discover_target_layers(
     model: nn.Module,
     target_names: List[str] = ["q_proj", "k_proj", "v_proj", "o_proj"],
-) -> List[str]:
+    return_dimensions: bool = True,
+) -> List[LayerInfo]:
     """
     Discover all layers in the model that match target names.
     
     This automatically handles the difference between DeltaNet and Attention
     layers since they both use the same projection names.
     
+    For Qwen3-Coder-Next, this discovers 192 layers with 4 unique shapes:
+    - (2048, 2048): DeltaNet q_proj, k_proj
+    - (2048, 4096): DeltaNet v_proj, Attention q_proj
+    - (4096, 2048): DeltaNet o_proj, Attention o_proj
+    - (2048, 512): Attention k_proj, v_proj
+    
+    Args:
+        model: The model to discover layers in
+        target_names: Names to match (e.g., ["q_proj", "k_proj", "v_proj", "o_proj"])
+        return_dimensions: If True, return LayerInfo with dimensions. 
+                          If False, just return List[str] for backwards compat.
+    
     Returns:
-        List of full layer paths, e.g., ["model.layers.0.self_attn.q_proj", ...]
+        List of LayerInfo(name, in_features, out_features)
     """
     discovered = []
     
@@ -188,10 +211,34 @@ def discover_target_layers(
         # Check if this module's name ends with a target
         for target in target_names:
             if name.endswith(target) and isinstance(module, nn.Linear):
-                discovered.append(name)
+                if return_dimensions:
+                    discovered.append(LayerInfo(
+                        name=name,
+                        in_features=module.in_features,
+                        out_features=module.out_features,
+                    ))
+                else:
+                    discovered.append(name)
                 break
     
     return discovered
+
+
+def group_layers_by_shape(
+    layers: List[LayerInfo],
+) -> Dict[Tuple[int, int], List[LayerInfo]]:
+    """
+    Group layers by their (in_features, out_features) shape.
+    
+    Returns a dict mapping shape tuples to lists of LayerInfo.
+    """
+    groups = {}
+    for layer in layers:
+        shape = (layer.in_features, layer.out_features)
+        if shape not in groups:
+            groups[shape] = []
+        groups[shape].append(layer)
+    return groups
 
 
 def create_layer_to_index_mapping(
