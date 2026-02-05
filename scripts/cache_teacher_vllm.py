@@ -13,8 +13,11 @@ Expected performance:
 - vLLM: ~30-60 samples/minute on 8xH200
 
 Usage:
-    # Production run (4 GPUs for Teacher)
+    # Production run (4 GPUs for Teacher, other 4 for Student training later)
     python scripts/cache_teacher_vllm.py --output_dir ./teacher_cache --tp 4
+    
+    # Maximum throughput (all 8 GPUs for caching, ~2x faster)
+    python scripts/cache_teacher_vllm.py --output_dir ./teacher_cache --tp 8
     
     # Test mode
     python scripts/cache_teacher_vllm.py --output_dir ./teacher_cache --test --max_samples 10

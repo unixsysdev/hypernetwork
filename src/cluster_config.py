@@ -44,7 +44,9 @@ class StudentConfig:
     
     def __post_init__(self):
         if self.devices is None:
-            self.devices = [4, 5, 6, 7]
+            # All 8 GPUs when using cached teacher logits (offline distillation)
+            # Use [4, 5, 6, 7] if running teacher on GPUs 0-3 simultaneously
+            self.devices = [0, 1, 2, 3, 4, 5, 6, 7]
 
 
 @dataclass
@@ -54,11 +56,12 @@ class ClusterConfig:
     student: StudentConfig = None
     
     # VRAM budget (in GB)
+    # When using cached teacher logits, all 8 GPUs are available for student
     total_vram: float = 1128.0  # 8 x 141GB H200
-    teacher_vram: float = 280.0  # FP8 480B
-    student_vram: float = 160.0  # BF16 80B
+    teacher_vram: float = 0.0  # 0 when using cached logits (offline distillation)
+    student_vram: float = 160.0  # BF16 80B across 8 GPUs
     hypernetwork_vram: float = 10.0
-    activation_headroom: float = 500.0  # For large batches
+    activation_headroom: float = 800.0  # B=8, 8K tokens, full-vocab softmax
     
     def __post_init__(self):
         if self.teacher is None:

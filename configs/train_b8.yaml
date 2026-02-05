@@ -1,13 +1,12 @@
-# Training Configuration for Hypernetwork Distillation
-# Default config: B=16 — recommended starting point
+# B=8 — Conservative / Safe
 #
-# See also:
-#   configs/train_b8.yaml   — Conservative, most optimizer steps (~5-10h)
-#   configs/train_b32.yaml  — Aggressive, fast iteration (~2-3h)
-#   configs/train_b64.yaml  — High throughput (~1-2h)
-#   configs/train_b128.yaml — Maximum throughput, experimental (~1h)
+# Best for: First runs, debugging, verifying convergence
+# Activation VRAM: ~44GB (plenty of headroom)
+# Optimizer steps: 75K (20 epochs × 3,750 steps)
+# Estimated runtime on 8xH200: ~5-10 hours
 #
-# Estimated runtime on 8xH200 with cached teacher: ~3-6 hours
+# This is the baseline config. LR is not scaled.
+# Most optimizer steps = most stable convergence.
 
 # Models
 teacher:
@@ -20,7 +19,7 @@ teacher:
 student:
   model_id: "Qwen/Qwen3-Coder-Next"
   dtype: "bfloat16"
-  devices: [0, 1, 2, 3, 4, 5, 6, 7]  # All GPUs when teacher logits are cached
+  devices: [0, 1, 2, 3, 4, 5, 6, 7]
   freeze_base: true
 
 # Hypernetwork
@@ -44,13 +43,13 @@ data:
 
 # Training
 training:
-  warmup_lr: 2.0e-5
+  warmup_lr: 1.0e-5
   warmup_epochs: 2
-  learning_rate: 2.0e-4  # Linear scaled from 1e-4 at B=8
+  learning_rate: 1.0e-4  # Base LR, no scaling
   epochs: 20
-  batch_size: 16
+  batch_size: 8
   gradient_accumulation_steps: 1
-  effective_batch_size: 16
+  effective_batch_size: 8
   optimizer: "adamw"
   weight_decay: 0.01
   beta1: 0.9
@@ -67,13 +66,13 @@ validation:
 
 # Checkpointing
 checkpointing:
-  save_dir: "./checkpoints"
+  save_dir: "./checkpoints/b8"
   save_every_epochs: 2
   keep_last_n: 5
 
 # Logging
 logging:
   wandb_project: "hypernetwork-distillation"
-  wandb_run_name: "b16-default"
+  wandb_run_name: "b8-conservative"
   wandb_enabled: true
   log_every_steps: 10

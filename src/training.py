@@ -52,12 +52,12 @@ class TrainingConfig:
     dropout: float = 0.1
     
     # Training
-    learning_rate: float = 1e-4
-    warmup_lr: float = 1e-5
-    epochs: int = 20
-    warmup_epochs: int = 2
-    batch_size: int = 4  # Batched LoRA via einsum enables true batching
-    gradient_accumulation_steps: int = 2  # Effective batch size = 8
+    learning_rate: float = 3e-4  # Sqrt scaled: 1e-4 × √(64/8) ≈ 3e-4
+    warmup_lr: float = 3e-5
+    epochs: int = 40  # More passes over data; 468 steps/epoch × 40 = 18.7K total steps
+    warmup_epochs: int = 4  # Longer warmup for larger LR
+    batch_size: int = 64  # Batched LoRA via einsum; ~352GB activations, fits in 8xH200 (~958GB free)
+    gradient_accumulation_steps: int = 1  # Single forward pass per optimizer step
     max_grad_norm: float = 1.0
     weight_decay: float = 0.01
     

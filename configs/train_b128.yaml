@@ -1,26 +1,20 @@
-# Training Configuration for Hypernetwork Distillation
-# Default config: B=16 — recommended starting point
-#
-# See also:
-#   configs/train_b8.yaml   — Conservative, most optimizer steps (~5-10h)
-#   configs/train_b32.yaml  — Aggressive, fast iteration (~2-3h)
-#   configs/train_b64.yaml  — High throughput (~1-2h)
-#   configs/train_b128.yaml — Maximum throughput, experimental (~1h)
-#
-# Estimated runtime on 8xH200 with cached teacher: ~3-6 hours
+# Training Configuration: B=128 (Maximum Throughput, Experimental)
+# ~704GB activation VRAM, 234 steps/epoch, ~18.7K total steps at 80 epochs
+# Estimated runtime on 8xH200: ~1-2 hours
+# WARNING: High LR and few steps per epoch may cause instability
 
 # Models
 teacher:
   model_id: "Qwen/Qwen3-Coder-480B-A35B-Instruct"
   quantization: "fp8"
-  tensor_parallel_size: 4
+  tensor_parallel_size: 8  # Use all 8 GPUs for caching
   gpu_memory_utilization: 0.90
-  devices: [0, 1, 2, 3]
+  devices: [0, 1, 2, 3, 4, 5, 6, 7]
 
 student:
   model_id: "Qwen/Qwen3-Coder-Next"
   dtype: "bfloat16"
-  devices: [0, 1, 2, 3, 4, 5, 6, 7]  # All GPUs when teacher logits are cached
+  devices: [0, 1, 2, 3, 4, 5, 6, 7]
   freeze_base: true
 
 # Hypernetwork
@@ -44,13 +38,13 @@ data:
 
 # Training
 training:
-  warmup_lr: 2.0e-5
-  warmup_epochs: 2
-  learning_rate: 2.0e-4  # Linear scaled from 1e-4 at B=8
-  epochs: 20
-  batch_size: 16
+  warmup_lr: 4.0e-5
+  warmup_epochs: 8  # Long warmup for high LR stability
+  learning_rate: 4.0e-4  # Sqrt scaled: 1e-4 × √(128/8) = 4e-4
+  epochs: 80  # 234 steps/epoch × 80 = 18.7K total steps
+  batch_size: 128
   gradient_accumulation_steps: 1
-  effective_batch_size: 16
+  effective_batch_size: 128
   optimizer: "adamw"
   weight_decay: 0.01
   beta1: 0.9
@@ -63,17 +57,17 @@ training:
 # Validation
 validation:
   val_split: 0.05
-  val_every_epochs: 1
+  val_every_epochs: 2  # Check every 2 epochs (still 40 checkpoints)
 
 # Checkpointing
 checkpointing:
   save_dir: "./checkpoints"
-  save_every_epochs: 2
+  save_every_epochs: 5
   keep_last_n: 5
 
 # Logging
 logging:
   wandb_project: "hypernetwork-distillation"
-  wandb_run_name: "b16-default"
+  wandb_run_name: "b128-experimental"
   wandb_enabled: true
-  log_every_steps: 10
+  log_every_steps: 5
