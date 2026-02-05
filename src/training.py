@@ -230,8 +230,23 @@ class DistillationTrainer:
             logger.info("Using cached teacher logits - Teacher model NOT loaded")
             self.teacher = None
         
-        # Initialize Hypernetwork
-        logger.info("Initializing Hypernetwork...")
+        # Setup LoRA injector (new hook-based version)
+        self.lora_injector = HookBasedLoRAInjector(
+            self.student,
+            scaling=self.config.lora_alpha / self.config.lora_rank,
+        )
+        
+        # CRITICAL: Discover target layers BEFORE creating Hypernetwork
+        # This ensures we pass the actual layer names, not guessed templates
+        self.target_layers = discover_target_layers(self.student)
+        logger.info(f"Found {len(self.target_layers)} target layers for LoRA")
+        
+        # Log sample layer names to verify DeltaNet vs Attention detection
+        if self.target_layers:
+            logger.info(f"Sample layers: {self.target_layers[:4]}")
+        
+        # Initialize Hypernetwork with ACTUAL discovered layer names
+        logger.info("Initializing Hypernetwork with discovered layer names...")
         lora_config = LoRAConfig(
             rank=self.config.lora_rank,
             alpha=self.config.lora_alpha,
@@ -241,11 +256,14 @@ class DistillationTrainer:
             num_encoder_layers=self.config.num_encoder_layers,
             num_heads=self.config.num_heads,
             lora_config=lora_config,
+            # CRITICAL: Pass the real layer names!
+            target_layer_names=self.target_layers,
         ).to(self.device)
         
         # Print parameter counts
         param_counts = self.hypernetwork.count_parameters()
         logger.info(f"Hypernetwork parameters: {param_counts}")
+        logger.info(f"Generating {self.hypernetwork.num_loras} LoRA adapters")
         
         # Setup optimizer (only Hypernetwork receives gradients)
         self.optimizer = AdamW(
@@ -256,16 +274,6 @@ class DistillationTrainer:
         
         # Setup mixed precision
         self.scaler = GradScaler()
-        
-        # Setup LoRA injector (new hook-based version)
-        self.lora_injector = HookBasedLoRAInjector(
-            self.student,
-            scaling=self.config.lora_alpha / self.config.lora_rank,
-        )
-        
-        # Discover target layers in student model
-        self.target_layers = discover_target_layers(self.student)
-        logger.info(f"Found {len(self.target_layers)} target layers for LoRA")
         
         logger.info("Setup complete!")
         

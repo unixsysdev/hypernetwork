@@ -223,10 +223,10 @@ class AgenticHyperNetwork(nn.Module):
     """
     Main Hypernetwork that generates dynamic LoRA adapters.
     
-    v2 Simplifications:
+    v3 Fixes:
+    - Uses DISCOVERED layer names, not template-based guessing
+    - Guarantees correct mapping for both Attention AND DeltaNet layers
     - Single unified generator for all layers
-    - Automatic layer discovery at runtime
-    - Clean dict output ready for hook-based injection
     """
     
     def __init__(
@@ -236,14 +236,14 @@ class AgenticHyperNetwork(nn.Module):
         num_heads: int = 8,
         lora_config: Optional[LoRAConfig] = None,
         dropout: float = 0.1,
-        # Layer path template for the target model
-        layer_path_template: str = "model.layers.{layer_idx}.self_attn.{module}",
+        # CRITICAL: Pass actual discovered layer names
+        target_layer_names: Optional[List[str]] = None,
     ):
         super().__init__()
         
         self.lora_config = lora_config or LoRAConfig()
         self.hidden_dim = hidden_dim
-        self.layer_path_template = layer_path_template
+        self.target_layer_names = target_layer_names  # e.g., ["model.layers.0.self_attn.q_proj", ...]
         
         # Prompt encoder
         self.prompt_encoder = PromptEncoder(
@@ -253,13 +253,21 @@ class AgenticHyperNetwork(nn.Module):
             dropout=dropout,
         )
         
-        # Single unified generator
+        # Determine number of LoRAs to generate
+        if target_layer_names is not None:
+            num_loras = len(target_layer_names)
+        else:
+            num_loras = self.lora_config.num_layers * len(self.lora_config.target_modules)
+        
+        self.num_loras = num_loras
+        
+        # Single unified generator - sized to match discovered layers
         self.lora_generator = UnifiedLoRAGenerator(
             context_dim=hidden_dim,
             hidden_dim=hidden_dim,
             lora_rank=self.lora_config.rank,
-            num_layers=self.lora_config.num_layers,
-            num_modules=len(self.lora_config.target_modules),
+            num_layers=num_loras,  # One embedding per discovered layer
+            num_modules=1,  # Flatten - each layer+module is one entry
             zero_init=True,
         )
         
@@ -296,7 +304,11 @@ class AgenticHyperNetwork(nn.Module):
         batch_idx: int = 0,
     ) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Convert batched output to dict keyed by layer path.
+        Convert batched output to dict keyed by ACTUAL layer paths.
+        
+        CRITICAL: Uses discovered layer names (ordered mapping).
+        The i-th generated LoRA goes to the i-th discovered layer.
+        This guarantees correct mapping for BOTH Attention AND DeltaNet layers.
         
         Args:
             lora_output: Output from forward()
@@ -304,23 +316,29 @@ class AgenticHyperNetwork(nn.Module):
             
         Returns:
             Dict mapping layer paths to (A, B) tuples
-            e.g., {"model.layers.0.self_attn.q_proj": (A, B), ...}
+            e.g., {"model.layers.0.self_attn.q_proj": (A, B), 
+                   "model.layers.1.deltanet.q_proj": (A, B), ...}
         """
-        cfg = self.lora_config
         lora_A = lora_output["lora_A"][batch_idx]  # [N, hidden_dim, rank]
         lora_B = lora_output["lora_B"][batch_idx]  # [N, rank, hidden_dim]
         
-        result = {}
-        idx = 0
+        # CRITICAL: Use actual discovered names, NOT template
+        if self.target_layer_names is None:
+            raise ValueError(
+                "target_layer_names must be provided to AgenticHyperNetwork. "
+                "Use discover_target_layers() to get the real layer names."
+            )
         
-        for layer_idx in range(cfg.num_layers):
-            for module in cfg.target_modules:
-                key = self.layer_path_template.format(
-                    layer_idx=layer_idx,
-                    module=module,
-                )
-                result[key] = (lora_A[idx], lora_B[idx])
-                idx += 1
+        if len(self.target_layer_names) != lora_A.shape[0]:
+            raise ValueError(
+                f"Mismatch: Generated {lora_A.shape[0]} LoRAs but have "
+                f"{len(self.target_layer_names)} target layers. "
+                f"This likely means the model architecture changed."
+            )
+        
+        result = {}
+        for idx, name in enumerate(self.target_layer_names):
+            result[name] = (lora_A[idx], lora_B[idx])
         
         return result
     
