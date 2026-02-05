@@ -1,0 +1,13 @@
+# Hypernetwork Distillation System
+# Distills Qwen3-Coder-480B into Qwen3-Coder-Next via dynamic LoRA generation
+
+torch>=2.4.0
+transformers>=4.51.0
+datasets>=3.0.0
+peft>=0.14.0
+vllm>=0.6.0
+flash-attn>=2.7.0
+accelerate>=1.0.0
+wandb
+einops
+pyarrow
