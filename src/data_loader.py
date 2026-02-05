@@ -106,6 +106,12 @@ class CachedDistillationDataset(Dataset):
         teacher_values = torch.from_numpy(data["values"].astype(np.float32))
         teacher_indices = torch.from_numpy(data["indices"].astype(np.int64))
         
+        # Detect format: 'logits' (raw) or 'logprobs' (from vLLM)
+        # Default to 'logprobs' for backwards compatibility with vLLM cache
+        teacher_format = 'logprobs'
+        if 'format' in data:
+            teacher_format = str(data['format'][0])
+        
         # Truncate teacher logits to match trajectory length
         seq_len = len(input_ids)
         if teacher_values.shape[0] > seq_len:
@@ -119,6 +125,7 @@ class CachedDistillationDataset(Dataset):
             "prompt_mask": prompt_mask,
             "teacher_values": teacher_values,      # [seq_len, top_k]
             "teacher_indices": teacher_indices,    # [seq_len, top_k]
+            "teacher_format": teacher_format,      # 'logits' or 'logprobs'
         }
 
 
@@ -387,6 +394,8 @@ def collate_fn_with_teacher(
     if has_teacher:
         result["teacher_values"] = torch.stack(teacher_values_list)
         result["teacher_indices"] = torch.stack(teacher_indices_list)
+        # Preserve format (assume consistent within batch)
+        result["teacher_format"] = batch[0].get("teacher_format", "logprobs")
     
     return result
 

@@ -85,51 +85,6 @@ class TrainingConfig:
     use_parallel_step: bool = True  # Use torch.compile optimized step
 
 
-def top_k_kl_divergence(
-    student_logits: torch.Tensor,
-    teacher_logits: torch.Tensor,
-    k: int = 128,
-    temperature: float = 1.0,
-) -> torch.Tensor:
-    """
-    Compute KL Divergence using only top-K logits.
-    
-    This is CRITICAL for bandwidth efficiency when transferring
-    Teacher logits from GPU Group 1 to GPU Group 2.
-    
-    Full vocab: 150,000 -> Too much data transfer
-    Top-K: 128 -> 1000x reduction
-    
-    Args:
-        student_logits: [B, L, V] - Student output logits
-        teacher_logits: [B, L, V] - Teacher output logits
-        k: Number of top logits to use
-        temperature: Temperature for softmax
-        
-    Returns:
-        KL divergence loss (scalar)
-    """
-    B, L, V = student_logits.shape
-    
-    # Get top-K indices from teacher
-    teacher_topk_values, teacher_topk_indices = torch.topk(
-        teacher_logits, k, dim=-1
-    )  # [B, L, K]
-    
-    # Gather corresponding student logits
-    student_topk_values = torch.gather(
-        student_logits, dim=-1, index=teacher_topk_indices
-    )  # [B, L, K]
-    
-    # Apply temperature and compute probabilities
-    teacher_probs = F.softmax(teacher_topk_values / temperature, dim=-1)
-    student_log_probs = F.log_softmax(student_topk_values / temperature, dim=-1)
-    
-    # KL Divergence: sum over vocabulary, mean over batch and sequence
-    kl = F.kl_div(student_log_probs, teacher_probs, reduction='batchmean')
-    
-    return kl
-
 
 def compute_distillation_loss(
     student_logits: torch.Tensor,
@@ -321,20 +276,21 @@ class DistillationTrainer:
         teacher_values: torch.Tensor,
         teacher_indices: torch.Tensor,
         attention_mask: torch.Tensor,
+        teacher_format: str = "logprobs",
     ) -> torch.Tensor:
         """
         Compute KL divergence using sparse (top-k) teacher logits.
         
-        IMPORTANT: teacher_values from vLLM are LOG PROBABILITIES (already log_softmax).
-        We need to handle them correctly:
-        - teacher_values = log P(teacher)  (FROM vLLM prompt_logprobs)
-        - student needs log_softmax applied
+        Handles both formats:
+        - 'logprobs': teacher_values are log-probs from vLLM (exp to get probs)
+        - 'logits': teacher_values are raw logits (apply softmax)
         
         Args:
             student_logits: [L, V] - Full student logits (raw, not softmaxed)
-            teacher_values: [L, K] - Top-K teacher LOG PROBABILITIES
+            teacher_values: [L, K] - Top-K teacher values (format-dependent)
             teacher_indices: [L, K] - Top-K teacher vocabulary indices
             attention_mask: [L] - Mask (1=compute, 0=ignore)
+            teacher_format: 'logprobs' or 'logits'
         
         Returns:
             KL divergence loss (scalar)
@@ -351,21 +307,22 @@ class DistillationTrainer:
         # Student: apply log_softmax to raw logits (restricted to top-K for approximation)
         student_log_probs = F.log_softmax(student_gathered / temperature, dim=-1)  # [L, K]
         
-        # Teacher: values are ALREADY log probs from vLLM!
-        # WARNING: Temperature scaling of log-probs is mathematically different from
-        # scaling logits before softmax. For temperature != 1.0, this is an approximation.
-        # Correct approach: cache raw logits, or apply temp during caching.
-        # For now: only apply temp=1.0 passthrough, warn otherwise.
-        if temperature != 1.0:
-            import warnings
-            warnings.warn(
-                f"Temperature={temperature} with cached vLLM log-probs is approximate. "
-                "For accurate temperature scaling, cache raw logits instead.",
-                UserWarning,
-            )
-        # Convert log-probs to probs and renormalize over top-K
-        teacher_probs = torch.exp(teacher_values)  # [L, K]
-        teacher_probs = teacher_probs / teacher_probs.sum(dim=-1, keepdim=True)  # Renormalize
+        # Teacher: convert to probabilities based on format
+        if teacher_format == "logits":
+            # Raw logits: apply softmax with temperature
+            teacher_probs = F.softmax(teacher_values / temperature, dim=-1)  # [L, K]
+        else:
+            # Log-probs from vLLM: exponentiate and renormalize
+            # WARNING: Temperature scaling of log-probs is mathematically approximate
+            if temperature != 1.0:
+                import warnings
+                warnings.warn(
+                    f"Temperature={temperature} with cached vLLM log-probs is approximate. "
+                    "For accurate temperature scaling, cache raw logits instead.",
+                    UserWarning,
+                )
+            teacher_probs = torch.exp(teacher_values)  # [L, K]
+            teacher_probs = teacher_probs / teacher_probs.sum(dim=-1, keepdim=True)  # Renormalize
         
         # Compute KL divergence per position: sum_k P(k) * [log P(k) - log Q(k)]
         kl_per_pos = F.kl_div(student_log_probs, teacher_probs, reduction='none').sum(dim=-1)  # [L]
@@ -412,6 +369,7 @@ class DistillationTrainer:
             # Load pre-computed teacher logits (top-k sparse format)
             teacher_values = batch["teacher_values"].to(self.device)  # [B, L, K]
             teacher_indices = batch["teacher_indices"].to(self.device)  # [B, L, K]
+            teacher_format = batch.get("teacher_format", "logprobs")  # 'logits' or 'logprobs'
         
         # 1. Get prompt embeddings (no grad through Student)
         with torch.no_grad():
@@ -443,6 +401,7 @@ class DistillationTrainer:
                     teacher_values[b],   # [L, K]
                     teacher_indices[b],  # [L, K]
                     attention_mask[b],   # [L]
+                    teacher_format=teacher_format,
                 )
             else:
                 # Runtime teacher inference (SLOW, requires massive VRAM)
@@ -566,11 +525,13 @@ class DistillationTrainer:
             student_logits = student_outputs.logits
         
         if has_cached_teacher:
+            teacher_format = batch.get("teacher_format", "logprobs")
             return self._compute_sparse_kl_loss(
                 student_logits[0],
                 teacher_values[batch_idx],
                 teacher_indices[batch_idx],
                 attention_mask[batch_idx],
+                teacher_format=teacher_format,
             )
         else:
             with torch.no_grad():
@@ -638,13 +599,14 @@ class DistillationTrainer:
         return {"avg_loss": total_loss / max(num_steps, 1)}
     
     def save_checkpoint(self, epoch: int, path: str):
-        """Save training checkpoint."""
+        """Save training checkpoint including scheduler state."""
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         
         checkpoint = {
             "epoch": epoch,
             "hypernetwork_state_dict": self.hypernetwork.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict() if hasattr(self, 'scheduler') else None,
             "config": self.config,
         }
         
@@ -658,7 +620,12 @@ class DistillationTrainer:
         self.hypernetwork.load_state_dict(checkpoint["hypernetwork_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         
-        logger.info(f"Loaded checkpoint from {path}")
+        # Restore scheduler state if available
+        if checkpoint.get("scheduler_state_dict") and hasattr(self, 'scheduler'):
+            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            logger.info("Restored scheduler state")
+        
+        logger.info(f"Loaded checkpoint from {path} (epoch {checkpoint['epoch']})")
         return checkpoint["epoch"]
     
     def train(self):

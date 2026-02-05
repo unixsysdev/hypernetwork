@@ -225,28 +225,37 @@ class ProducerConsumerPipeline:
         self.use_cuda_ipc = use_cuda_ipc
         self._stop_event = threading.Event()
         
-    def producer_loop(self, teacher, dataloader):
+    def producer_loop(self, teacher, dataloader, top_k: int = 128):
         """
         Producer thread: Generate Teacher logits.
         
-        Runs on GPUs 0-3.
+        Runs on GPUs 0-3. Converts dense logits to sparse top-k format
+        to match what train_step expects.
         """
         for batch in dataloader:
             if self._stop_event.is_set():
                 break
                 
             with torch.no_grad():
-                teacher_logits = teacher(batch["input_ids"]).logits
+                teacher_logits = teacher(batch["input_ids"]).logits  # [B, L, V]
+                
+                # Convert to sparse top-k format (matches cached teacher format)
+                teacher_values, teacher_indices = torch.topk(teacher_logits, top_k, dim=-1)
                 
                 # Move to CPU to decouple from Teacher GPUs
                 if not self.use_cuda_ipc:
-                    teacher_logits = teacher_logits.cpu()
+                    teacher_values = teacher_values.cpu()
+                    teacher_indices = teacher_indices.cpu()
             
-            # Put in queue (blocks if full)
+            # Put in queue with keys matching train_step expectations
             self.queue.put({
                 "input_ids": batch["input_ids"],
                 "attention_mask": batch["attention_mask"],
-                "teacher_logits": teacher_logits,
+                "prompt_ids": batch.get("prompt_ids", batch["input_ids"][:, :512]),
+                "prompt_mask": batch.get("prompt_mask", batch["attention_mask"][:, :512]),
+                "teacher_values": teacher_values,    # Sparse format
+                "teacher_indices": teacher_indices,  # Sparse format
+                "teacher_format": "logits",          # These are raw logits, not log-probs
             })
     
     def consumer_loop(self, trainer, num_steps: int):
@@ -264,10 +273,10 @@ class ProducerConsumerPipeline:
             
             # Move Teacher logits to training device
             if not self.use_cuda_ipc:
-                batch["teacher_logits"] = batch["teacher_logits"].cuda()
+                batch["teacher_values"] = batch["teacher_values"].cuda()
+                batch["teacher_indices"] = batch["teacher_indices"].cuda()
             
-            # Train step (uses standard train_step with teacher_logits in batch)
-            # NOTE: For real usage, adapt batch format to match train_step expectations
+            # Train step
             trainer.train_step(batch)
     
     def stop(self):

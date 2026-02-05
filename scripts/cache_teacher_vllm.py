@@ -218,12 +218,13 @@ def process_batch(
                     values[pos, k_idx] = logprob_obj.logprob
                     token_indices[pos, k_idx] = token_id
             
-            # Save
+            # Save with format marker
             np.savez_compressed(
                 output_path,
                 values=values,
                 indices=token_indices,
                 input_ids=np.array(input_ids, dtype=np.int32),
+                format=np.array(['logprobs']),  # Mark as log-probs from vLLM
             )
             
         except Exception as e:
@@ -282,6 +283,7 @@ def cache_with_transformers(
                 values=values,
                 indices=indices,
                 input_ids=input_ids.cpu().numpy().astype(np.int32),
+                format=np.array(['logits']),  # Transformers gives raw logits
             )
             
         except Exception as e:

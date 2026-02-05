@@ -103,12 +103,13 @@ def cache_single_trajectory(
     # Extract top-K
     values, indices = compute_top_k_logits(logits, k=top_k)
     
-    # Save compressed
+    # Save compressed with format marker
     np.savez_compressed(
         output_path,
         values=values,
         indices=indices,
         input_ids=input_ids.cpu().numpy().astype(np.int32),
+        format=np.array(['logits']),  # Mark as raw logits (not log-probs)
     )
 
 
