@@ -217,12 +217,14 @@ class ProducerConsumerPipeline:
         self,
         queue_size: int = 32,
         use_cuda_ipc: bool = False,
+        max_prompt_tokens: int = 512,
     ):
         import queue
         import threading
         
         self.queue = queue.Queue(maxsize=queue_size)
         self.use_cuda_ipc = use_cuda_ipc
+        self.max_prompt_tokens = max_prompt_tokens
         self._stop_event = threading.Event()
         
     def producer_loop(self, teacher, dataloader, top_k: int = 128):
@@ -248,11 +250,12 @@ class ProducerConsumerPipeline:
                     teacher_indices = teacher_indices.cpu()
             
             # Put in queue with keys matching train_step expectations
+            max_len = self.max_prompt_tokens
             self.queue.put({
                 "input_ids": batch["input_ids"],
                 "attention_mask": batch["attention_mask"],
-                "prompt_ids": batch.get("prompt_ids", batch["input_ids"][:, :512]),
-                "prompt_mask": batch.get("prompt_mask", batch["attention_mask"][:, :512]),
+                "prompt_ids": batch.get("prompt_ids", batch["input_ids"][:, :max_len]),
+                "prompt_mask": batch.get("prompt_mask", batch["attention_mask"][:, :max_len]),
                 "teacher_values": teacher_values,    # Sparse format
                 "teacher_indices": teacher_indices,  # Sparse format
                 "teacher_format": "logits",          # These are raw logits, not log-probs
