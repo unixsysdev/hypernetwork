@@ -25,7 +25,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-from torch.amp import autocast, GradScaler
+from torch.amp import autocast  # GradScaler not needed for bfloat16
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import wandb
 
@@ -109,14 +109,13 @@ def compute_distillation_loss(
         teacher_logits, top_k, dim=-1
     )  # [B, L, K]
     
-    # Gather corresponding student logits
-    student_topk_values = torch.gather(
-        student_logits, dim=-1, index=teacher_topk_indices
-    )  # [B, L, K]
+    # CRITICAL: Apply log_softmax over FULL vocab BEFORE gathering!
+    # This ensures the normalization constant is correct.
+    student_log_probs_full = F.log_softmax(student_logits / temperature, dim=-1)  # [B, L, V]
+    student_log_probs = torch.gather(student_log_probs_full, dim=-1, index=teacher_topk_indices)  # [B, L, K]
     
-    # Apply temperature and compute probabilities
-    teacher_probs = F.softmax(teacher_topk_values / temperature, dim=-1)
-    student_log_probs = F.log_softmax(student_topk_values / temperature, dim=-1)
+    # Teacher: softmax over just top-K (this is an approximation, but for teacher it's OK)
+    teacher_probs = F.softmax(teacher_topk_values / temperature, dim=-1)  # [B, L, K]
     
     # KL per position: sum over K vocab entries
     kl_per_pos = F.kl_div(student_log_probs, teacher_probs, reduction='none').sum(dim=-1)  # [B, L]
@@ -242,9 +241,7 @@ class DistillationTrainer:
             lr=self.config.learning_rate,
             weight_decay=self.config.weight_decay,
         )
-        
-        # Setup mixed precision
-        self.scaler = GradScaler("cuda")
+        # Note: GradScaler is NOT needed for bfloat16 (same exponent range as fp32)
         
         # Pre-compile forward function for train_step_parallel (saves 30s per step!)
         self._compiled_forward = None
@@ -298,14 +295,14 @@ class DistillationTrainer:
         L, V = student_logits.shape
         K = teacher_values.shape[-1]
         
-        # Gather student logits at teacher's top-K indices
-        student_gathered = torch.gather(student_logits, dim=-1, index=teacher_indices)
-        
         # Apply temperature
         temperature = self.config.temperature
         
-        # Student: apply log_softmax to raw logits (restricted to top-K for approximation)
-        student_log_probs = F.log_softmax(student_gathered / temperature, dim=-1)  # [L, K]
+        # CRITICAL: Apply log_softmax over FULL vocab BEFORE gathering!
+        # This ensures the normalization constant is correct.
+        # Previous bug: log_softmax(gathered) uses wrong normalization over K values
+        student_log_probs_full = F.log_softmax(student_logits / temperature, dim=-1)  # [L, V]
+        student_log_probs = torch.gather(student_log_probs_full, dim=-1, index=teacher_indices)  # [L, K]
         
         # Teacher: convert to probabilities based on format
         if teacher_format == "logits":
@@ -426,7 +423,7 @@ class DistillationTrainer:
         loss = total_loss / batch_size / self.config.gradient_accumulation_steps
         
         # 6. Backprop
-        self.scaler.scale(loss).backward()
+        loss.backward()
         
         return {
             "loss": loss.item(),
@@ -466,6 +463,9 @@ class DistillationTrainer:
         if has_cached_teacher:
             teacher_values = batch["teacher_values"].to(self.device)
             teacher_indices = batch["teacher_indices"].to(self.device)
+            teacher_format = batch.get("teacher_format", "logprobs")
+        else:
+            teacher_format = "logprobs"  # Unused but needed for signature
         
         # Get prompt embeddings
         with torch.no_grad():
@@ -489,6 +489,7 @@ class DistillationTrainer:
                 teacher_values if has_cached_teacher else None,
                 teacher_indices if has_cached_teacher else None,
                 has_cached_teacher,
+                teacher_format,
             )
             losses.append(loss)
         
@@ -496,7 +497,7 @@ class DistillationTrainer:
         total_loss = torch.stack(losses).mean() / self.config.gradient_accumulation_steps
         
         # Backprop
-        self.scaler.scale(total_loss).backward()
+        total_loss.backward()
         
         return {
             "loss": total_loss.item(),
@@ -512,6 +513,7 @@ class DistillationTrainer:
         teacher_values: Optional[torch.Tensor],
         teacher_indices: Optional[torch.Tensor],
         has_cached_teacher: bool,
+        teacher_format: str = "logprobs",
     ) -> torch.Tensor:
         """Process a single sample - separated for potential torch.compile."""
         lora_dict = self.hypernetwork.get_lora_dict(lora_output, batch_idx=batch_idx)
@@ -525,7 +527,6 @@ class DistillationTrainer:
             student_logits = student_outputs.logits
         
         if has_cached_teacher:
-            teacher_format = batch.get("teacher_format", "logprobs")
             return self._compute_sparse_kl_loss(
                 student_logits[0],
                 teacher_values[batch_idx],
@@ -569,16 +570,14 @@ class DistillationTrainer:
             
             # Gradient accumulation step
             if (step + 1) % self.config.gradient_accumulation_steps == 0:
-                # Clip gradients
-                self.scaler.unscale_(self.optimizer)
+                # Clip gradients (no scaler needed for bfloat16)
                 torch.nn.utils.clip_grad_norm_(
                     self.hypernetwork.parameters(),
                     self.config.max_grad_norm,
                 )
                 
                 # Optimizer step
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                self.optimizer.step()
                 self.optimizer.zero_grad()
                 self.scheduler.step()
                 

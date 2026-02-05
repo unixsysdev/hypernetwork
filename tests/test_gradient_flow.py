@@ -32,11 +32,20 @@ def test_hypernetwork_gradient_flow():
     
     # Create small config for testing
     config = LoRAConfig(rank=8, alpha=16, num_layers=4, hidden_dim=128)
+    
+    # Create mock layer shapes (4 layers × 4 modules)
+    layer_shapes = [
+        (f"model.layers.{i}.self_attn.{m}", 128, 128)
+        for i in range(4)
+        for m in ["q_proj", "k_proj", "v_proj", "o_proj"]
+    ]
+    
     hypernet = AgenticHyperNetwork(
         hidden_dim=128,
         num_encoder_layers=2,
         num_heads=4,
         lora_config=config,
+        target_layer_names=layer_shapes,
     )
     
     # Simulate prompt embeddings
@@ -48,8 +57,8 @@ def test_hypernetwork_gradient_flow():
     # Forward pass
     output = hypernet(prompt_embeds, prompt_mask)
     
-    # Compute dummy loss
-    loss = output["lora_A"].sum() + output["lora_B"].sum()
+    # Compute dummy loss from lora_dict
+    loss = sum(A.sum() + B.sum() for A, B in output["lora_dict"].values())
     loss.backward()
     
     # Check gradients
@@ -139,8 +148,11 @@ def test_zero_initialization():
     
     student = MockStudent()
     
-    # Discover target layers (simulates real behavior)
-    target_layers = ["q_proj", "k_proj"]
+    # Create layer shapes with dimensions
+    layer_shapes = [
+        ("q_proj", 64, 64),
+        ("k_proj", 64, 64),
+    ]
     
     config = LoRAConfig(rank=8, alpha=16, num_layers=2, hidden_dim=64)
     hypernet = AgenticHyperNetwork(
@@ -148,7 +160,7 @@ def test_zero_initialization():
         num_encoder_layers=1,
         num_heads=2,
         lora_config=config,
-        target_layer_names=target_layers,  # NEW API - pass discovered layers
+        target_layer_names=layer_shapes,
     )
     
     injector = HookBasedLoRAInjector(student, scaling=2.0)
@@ -173,8 +185,12 @@ def test_zero_initialization():
     # Check difference
     diff = (base_output - lora_applied_output).abs().max().item()
     
+    # Get B matrix mean from lora_dict
+    b_means = [B.abs().mean().item() for _, B in lora_output["lora_dict"].values()]
+    b_mean = sum(b_means) / len(b_means)
+    
     print(f"  Max difference between base and LoRA output: {diff:.6f}")
-    print(f"  LoRA B matrix mean abs: {lora_output['lora_B'].abs().mean().item():.6f}")
+    print(f"  LoRA B matrix mean abs: {b_mean:.6f}")
     
     # With zero-init, B matrices should be ~0, so output should be nearly identical
     passed = diff < 0.1  # Allow small numerical differences
@@ -190,12 +206,20 @@ def test_gradient_magnitude():
     
     from src.hypernetwork import AgenticHyperNetwork, LoRAConfig
     
+    # Create layer shapes
+    layer_shapes = [
+        (f"model.layers.{i}.self_attn.{m}", 128, 128)
+        for i in range(4)
+        for m in ["q_proj", "k_proj", "v_proj", "o_proj"]
+    ]
+    
     config = LoRAConfig(rank=8, alpha=16, num_layers=4, hidden_dim=128)
     hypernet = AgenticHyperNetwork(
         hidden_dim=128,
         num_encoder_layers=2,
         num_heads=4,
         lora_config=config,
+        target_layer_names=layer_shapes,
     )
     
     # Forward pass
@@ -204,9 +228,10 @@ def test_gradient_magnitude():
     
     output = hypernet(prompt_embeds, prompt_mask)
     
-    # Simulate distillation loss
-    fake_target = torch.randn_like(output["lora_A"])
-    loss = F.mse_loss(output["lora_A"], fake_target)
+    # Simulate distillation loss using lora_dict
+    first_layer = next(iter(output["lora_dict"].keys()))
+    fake_target = torch.randn_like(output["lora_dict"][first_layer][0])
+    loss = F.mse_loss(output["lora_dict"][first_layer][0], fake_target)
     loss.backward()
     
     # Check gradient norms
@@ -264,9 +289,10 @@ def test_layer_discovery():
     
     targets = discover_target_layers(model)
     
+    # Now returns LayerInfo tuples: (name, in_features, out_features)
     print(f"  Discovered {len(targets)} target layers")
     for t in targets[:4]:
-        print(f"    - {t}")
+        print(f"    - {t.name} ({t.in_features} -> {t.out_features})")
     if len(targets) > 4:
         print(f"    ... and {len(targets) - 4} more")
     
