@@ -66,6 +66,40 @@ def make_lora_hook(
     return hook
 
 
+def make_batched_lora_hook(
+    lora_A: torch.Tensor,
+    lora_B: torch.Tensor,
+    scaling: float = 1.0,
+) -> Callable:
+    """
+    Create a forward hook that applies PER-SAMPLE LoRA deltas to a batched output.
+    
+    This allows a single batched forward pass through the student model while
+    applying different LoRA weights to each sample in the batch. Uses einsum
+    for efficient batched matrix multiplication on GPU.
+    
+    Args:
+        lora_A: [B, in_features, rank] - Per-sample down projections
+        lora_B: [B, rank, out_features] - Per-sample up projections
+        scaling: alpha / rank
+    
+    Returns:
+        Hook function compatible with register_forward_hook
+    """
+    def hook(module: nn.Module, input: Tuple[torch.Tensor, ...], output: torch.Tensor) -> torch.Tensor:
+        x = input[0]  # [B, L, in_features]
+        
+        # Batched LoRA: each sample gets its own (A, B) matrices
+        # intermediate[b,l,r] = sum_d x[b,l,d] * A[b,d,r]
+        intermediate = torch.einsum('bld,bdr->blr', x, lora_A)
+        # delta[b,l,o] = sum_r intermediate[b,l,r] * B[b,r,o]
+        lora_delta = torch.einsum('blr,bro->blo', intermediate, lora_B) * scaling
+        
+        return output + lora_delta
+    
+    return hook
+
+
 class HookBasedLoRAInjector:
     """
     Manages LoRA injection via forward hooks.
@@ -124,6 +158,44 @@ class HookBasedLoRAInjector:
             
         finally:
             # Always remove hooks, even if exception occurs
+            for handle in handles:
+                handle.remove()
+    
+    @contextmanager
+    def apply_batched_lora(
+        self,
+        batched_lora_dict: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
+    ):
+        """
+        Context manager to apply PER-SAMPLE LoRA weights to a batched forward pass.
+        
+        This enables a single batched student forward pass with different LoRA
+        weights per sample, instead of B sequential forward passes.
+        Uses einsum for efficient batched matrix multiplication.
+        
+        Args:
+            batched_lora_dict: Maps layer names to (lora_A, lora_B) tuples
+                where lora_A: [B, in_features, rank]
+                      lora_B: [B, rank, out_features]
+        """
+        handles: List[torch.utils.hooks.RemovableHandle] = []
+        
+        try:
+            for name, (lora_A, lora_B) in batched_lora_dict.items():
+                module = get_module_by_name(self.model, name)
+                
+                if module is None:
+                    continue
+                if not isinstance(module, nn.Linear):
+                    continue
+                
+                hook = make_batched_lora_hook(lora_A, lora_B, self.scaling)
+                handle = module.register_forward_hook(hook)
+                handles.append(handle)
+            
+            yield
+            
+        finally:
             for handle in handles:
                 handle.remove()
 

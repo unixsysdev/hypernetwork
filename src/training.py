@@ -56,8 +56,8 @@ class TrainingConfig:
     warmup_lr: float = 1e-5
     epochs: int = 20
     warmup_epochs: int = 2
-    batch_size: int = 1  # Keep at 1 to avoid sequential per-sample LoRA overhead
-    gradient_accumulation_steps: int = 8  # Effective batch size = 8
+    batch_size: int = 4  # Batched LoRA via einsum enables true batching
+    gradient_accumulation_steps: int = 2  # Effective batch size = 8
     max_grad_norm: float = 1.0
     weight_decay: float = 0.01
     
@@ -325,6 +325,57 @@ class DistillationTrainer:
         loss = masked_kl.sum() / (mask.sum() + 1e-8)
         
         return loss
+
+    def _compute_batched_sparse_kl_loss(
+        self,
+        student_logits: torch.Tensor,
+        teacher_values: torch.Tensor,
+        teacher_indices: torch.Tensor,
+        attention_mask: torch.Tensor,
+        teacher_format: str = "logprobs",
+    ) -> torch.Tensor:
+        """
+        Compute KL divergence for a full batch at once.
+        
+        Args:
+            student_logits: [B, L, V] - Full student logits
+            teacher_values: [B, L, K] - Top-K teacher values
+            teacher_indices: [B, L, K] - Top-K teacher vocabulary indices
+            attention_mask: [B, L] - Mask (1=compute, 0=ignore)
+            teacher_format: 'logprobs' or 'logits'
+        
+        Returns:
+            KL divergence loss (scalar, averaged over all valid positions in batch)
+        """
+        temperature = self.config.temperature
+        
+        # Full-vocab log_softmax, then gather at teacher indices
+        student_log_probs_full = F.log_softmax(student_logits / temperature, dim=-1)  # [B, L, V]
+        student_log_probs = torch.gather(student_log_probs_full, dim=-1, index=teacher_indices)  # [B, L, K]
+        
+        # Teacher probabilities
+        if teacher_format == "logits":
+            teacher_probs = F.softmax(teacher_values / temperature, dim=-1)  # [B, L, K]
+        else:
+            if temperature != 1.0:
+                import warnings
+                warnings.warn(
+                    f"Temperature={temperature} with cached vLLM log-probs is approximate. "
+                    "For accurate temperature scaling, cache raw logits instead.",
+                    UserWarning,
+                )
+            teacher_probs = torch.exp(teacher_values)  # [B, L, K]
+            teacher_probs = teacher_probs / teacher_probs.sum(dim=-1, keepdim=True)
+        
+        # KL per position
+        kl_per_pos = F.kl_div(student_log_probs, teacher_probs, reduction='none').sum(dim=-1)  # [B, L]
+        
+        # Mask and average over all valid positions across the batch
+        mask = attention_mask.float()  # [B, L]
+        masked_kl = kl_per_pos * mask
+        loss = masked_kl.sum() / (mask.sum() + 1e-8)
+        
+        return loss
     
     def train_step(
         self,
@@ -428,11 +479,11 @@ class DistillationTrainer:
         batch: Dict[str, torch.Tensor],
     ) -> Dict[str, float]:
         """
-        Training step with loss stacking for single backward pass.
+        Batched training step — single student forward pass for the entire batch.
         
-        NOTE: Per-sample LoRA application is sequential due to needing different
-        LoRA weights per sample. To avoid wasting GPU cycles, keep batch_size=1
-        and use gradient_accumulation_steps for effective batch size.
+        Uses einsum-based batched LoRA hooks so that each sample in the batch
+        gets its own LoRA weights applied, while sharing a single student
+        forward pass. This is ~Bx faster than sequential per-sample passes.
         """
         # Move batch to device
         input_ids = batch["input_ids"].to(self.device)
@@ -451,84 +502,55 @@ class DistillationTrainer:
             teacher_indices = batch["teacher_indices"].to(self.device)
             teacher_format = batch.get("teacher_format", "logprobs")
         else:
-            teacher_format = "logprobs"  # Unused but needed for signature
+            teacher_format = "logprobs"
         
         # Get prompt embeddings
         with torch.no_grad():
             prompt_embeds = self.get_student_embeddings(prompt_ids)
         
-        # Hypernetwork generates ALL LoRAs at once (this is already batched!)
+        # Hypernetwork generates ALL LoRAs at once (already batched)
         lora_output = self.hypernetwork(prompt_embeds, prompt_mask)
+        lora_dict = lora_output["lora_dict"]  # Dict[name -> (A[B,in,r], B[B,r,out])]
         
-        batch_size = input_ids.shape[0]
-        
-        losses = []
-        
-        
-        for b in range(batch_size):
-            loss = self._single_sample_forward(
-                b, lora_output, input_ids, attention_mask,
-                teacher_values if has_cached_teacher else None,
-                teacher_indices if has_cached_teacher else None,
-                has_cached_teacher,
-                teacher_format,
-            )
-            losses.append(loss)
-        
-        # Sum and average losses, scaled for gradient accumulation
-        total_loss = torch.stack(losses).mean() / self.config.gradient_accumulation_steps
-        
-        # Backprop
-        total_loss.backward()
-        
-        return {
-            "loss": total_loss.item(),
-            "context_norm": lora_output["context"].norm().item(),
-        }
-    
-    def _single_sample_forward(
-        self,
-        batch_idx: int,
-        lora_output: Dict[str, torch.Tensor],
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        teacher_values: Optional[torch.Tensor],
-        teacher_indices: Optional[torch.Tensor],
-        has_cached_teacher: bool,
-        teacher_format: str = "logprobs",
-    ) -> torch.Tensor:
-        """Process a single sample with its own LoRA weights."""
-        lora_dict = self.hypernetwork.get_lora_dict(lora_output, batch_idx=batch_idx)
-        
-        # Use autocast for mixed precision (bfloat16 on H200)
-        with self.lora_injector.apply_lora(lora_dict), autocast("cuda", dtype=torch.bfloat16):
+        # Single batched student forward pass with per-sample LoRA
+        with self.lora_injector.apply_batched_lora(lora_dict), autocast("cuda", dtype=torch.bfloat16):
             student_outputs = self.student(
-                input_ids=input_ids[batch_idx:batch_idx+1],
-                attention_mask=attention_mask[batch_idx:batch_idx+1],
+                input_ids=input_ids,
+                attention_mask=attention_mask,
             )
-            student_logits = student_outputs.logits
+            student_logits = student_outputs.logits  # [B, L, V]
         
+        # Compute loss
         if has_cached_teacher:
-            return self._compute_sparse_kl_loss(
-                student_logits[0],
-                teacher_values[batch_idx],
-                teacher_indices[batch_idx],
-                attention_mask[batch_idx],
+            loss = self._compute_batched_sparse_kl_loss(
+                student_logits,
+                teacher_values,
+                teacher_indices,
+                attention_mask,
                 teacher_format=teacher_format,
             )
         else:
             with torch.no_grad():
                 teacher_outputs = self.teacher(
-                    input_ids=input_ids[batch_idx:batch_idx+1],
-                    attention_mask=attention_mask[batch_idx:batch_idx+1],
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
                 )
-            return compute_distillation_loss(
+            loss = compute_distillation_loss(
                 student_logits,
                 teacher_outputs.logits,
-                attention_mask[batch_idx:batch_idx+1],
+                attention_mask,
                 top_k=self.config.top_k_logits,
                 temperature=self.config.temperature,
             )
+        
+        # Scale for gradient accumulation
+        loss = loss / self.config.gradient_accumulation_steps
+        loss.backward()
+        
+        return {
+            "loss": loss.item(),
+            "context_norm": lora_output["context"].norm().item(),
+        }
     
     def train_epoch(
         self,
@@ -580,7 +602,7 @@ class DistillationTrainer:
         self,
         dataloader,
     ) -> Dict[str, float]:
-        """Run validation and return metrics."""
+        """Run validation using batched LoRA forward passes."""
         self.hypernetwork.eval()
         
         total_loss = 0.0
@@ -605,43 +627,38 @@ class DistillationTrainer:
             
             prompt_embeds = self.get_student_embeddings(prompt_ids)
             lora_output = self.hypernetwork(prompt_embeds, prompt_mask)
+            lora_dict = lora_output["lora_dict"]
             
-            batch_size = input_ids.shape[0]
-            batch_loss = 0.0
+            # Batched forward pass
+            with self.lora_injector.apply_batched_lora(lora_dict), autocast("cuda", dtype=torch.bfloat16):
+                student_outputs = self.student(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                )
+                student_logits = student_outputs.logits
             
-            for b in range(batch_size):
-                lora_dict = self.hypernetwork.get_lora_dict(lora_output, batch_idx=b)
-                
-                with self.lora_injector.apply_lora(lora_dict), autocast("cuda", dtype=torch.bfloat16):
-                    student_outputs = self.student(
-                        input_ids=input_ids[b:b+1],
-                        attention_mask=attention_mask[b:b+1],
-                    )
-                    student_logits = student_outputs.logits
-                
-                if has_cached_teacher:
-                    loss = self._compute_sparse_kl_loss(
-                        student_logits[0],
-                        teacher_values[b],
-                        teacher_indices[b],
-                        attention_mask[b],
-                        teacher_format=teacher_format,
-                    )
-                else:
-                    teacher_outputs = self.teacher(
-                        input_ids=input_ids[b:b+1],
-                        attention_mask=attention_mask[b:b+1],
-                    )
-                    loss = compute_distillation_loss(
-                        student_logits,
-                        teacher_outputs.logits,
-                        attention_mask[b:b+1],
-                        top_k=self.config.top_k_logits,
-                        temperature=self.config.temperature,
-                    )
-                batch_loss += loss.item()
+            if has_cached_teacher:
+                loss = self._compute_batched_sparse_kl_loss(
+                    student_logits,
+                    teacher_values,
+                    teacher_indices,
+                    attention_mask,
+                    teacher_format=teacher_format,
+                )
+            else:
+                teacher_outputs = self.teacher(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                )
+                loss = compute_distillation_loss(
+                    student_logits,
+                    teacher_outputs.logits,
+                    attention_mask,
+                    top_k=self.config.top_k_logits,
+                    temperature=self.config.temperature,
+                )
             
-            total_loss += batch_loss / batch_size
+            total_loss += loss.item()
             num_steps += 1
         
         self.hypernetwork.train()

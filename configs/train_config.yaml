@@ -43,8 +43,8 @@ training:
   # Main training
   learning_rate: 1.0e-4
   epochs: 20
-  batch_size: 1  # Keep at 1 to avoid sequential per-sample LoRA overhead
-  gradient_accumulation_steps: 8  # Effective batch size = 8
+  batch_size: 4  # Batched LoRA via einsum enables true batching
+  gradient_accumulation_steps: 2  # Effective batch size = 8
   effective_batch_size: 8
   
   # Optimizer
