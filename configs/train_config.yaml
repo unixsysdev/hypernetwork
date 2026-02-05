@@ -1,26 +1,24 @@
 # Training Configuration for Hypernetwork Distillation
-# Default config: B=16 — recommended starting point
+# Full trajectory training: 131K context for complete SWE-bench solutions
 #
-# See also:
-#   configs/train_b8.yaml   — Conservative, most optimizer steps (~5-10h)
-#   configs/train_b32.yaml  — Aggressive, fast iteration (~2-3h)
-#   configs/train_b64.yaml  — High throughput (~1-2h)
-#   configs/train_b128.yaml — Maximum throughput, experimental (~1h)
+# VRAM: 8×H200 = 1128GB total, ~958GB free after model weights
+# At 131K tokens: ~87GB activation per sample → max B=8-10
 #
-# Estimated runtime on 8xH200 with cached teacher: ~3-6 hours
+# Estimated runtime: ~3-5 days on 8xH200
+# Teacher caching: python scripts/cache_teacher_vllm.py --tp 8
 
 # Models
 teacher:
   model_id: "Qwen/Qwen3-Coder-480B-A35B-Instruct"
   quantization: "fp8"
-  tensor_parallel_size: 4
+  tensor_parallel_size: 8
   gpu_memory_utilization: 0.90
-  devices: [0, 1, 2, 3]
+  devices: [0, 1, 2, 3, 4, 5, 6, 7]
 
 student:
   model_id: "Qwen/Qwen3-Coder-Next"
   dtype: "bfloat16"
-  devices: [0, 1, 2, 3, 4, 5, 6, 7]  # All GPUs when teacher logits are cached
+  devices: [0, 1, 2, 3, 4, 5, 6, 7]
   freeze_base: true
 
 # Hypernetwork
@@ -37,20 +35,20 @@ hypernetwork:
 data:
   dataset_id: "nebius/SWE-rebench-openhands-trajectories"
   filter_resolved: true
-  max_prompt_tokens: 512
-  max_trajectory_tokens: 8192
+  max_prompt_tokens: 8192       # Hypernetwork input (task description)
+  max_trajectory_tokens: 131072  # Full trajectory for distillation
   cache_dir: "./data/cache"
   arrow_path: "./data/tokenized.arrow"
 
 # Training
 training:
-  warmup_lr: 2.0e-5
+  warmup_lr: 1.0e-5
   warmup_epochs: 2
-  learning_rate: 2.0e-4  # Linear scaled from 1e-4 at B=8
+  learning_rate: 1.0e-4  # Conservative LR for full-context training
   epochs: 20
-  batch_size: 16
+  batch_size: 8  # Max safe at 131K (~696GB activation)
   gradient_accumulation_steps: 1
-  effective_batch_size: 16
+  effective_batch_size: 8
   optimizer: "adamw"
   weight_decay: 0.01
   beta1: 0.9
@@ -68,12 +66,12 @@ validation:
 # Checkpointing
 checkpointing:
   save_dir: "./checkpoints"
-  save_every_epochs: 2
+  save_every_epochs: 1  # Save more frequently for long runs
   keep_last_n: 5
 
 # Logging
 logging:
   wandb_project: "hypernetwork-distillation"
-  wandb_run_name: "b16-default"
+  wandb_run_name: "full-trajectory-131k"
   wandb_enabled: true
   log_every_steps: 10
