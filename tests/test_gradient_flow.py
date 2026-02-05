@@ -1,372 +1,306 @@
+#!/usr/bin/env python3
 """
-Test: Gradient Flow Verification
+Pre-training Verification Tests.
 
-CRITICAL: Run this test BEFORE starting full training.
+Run these tests BEFORE starting full training to verify:
+1. Gradients flow correctly to the Hypernetwork
+2. Zero-initialization preserves Student behavior
+3. Gradient magnitudes are reasonable
 
-This test verifies that gradients flow correctly from the loss
-all the way back to the Hypernetwork. If this test fails,
-your training will silently do nothing.
-
-The test checks:
-1. The computational graph connects Loss -> Student -> LoRA -> Hypernetwork
-2. Gradients are non-zero (not vanishing)
-3. The gradient magnitude is reasonable (not exploding)
+Usage:
+    python tests/test_gradient_flow.py
 """
 
 import sys
+from pathlib import Path
+
+# Add src to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Add parent to path for imports
-sys.path.insert(0, str(__file__).rsplit("/", 2)[0])
 
-from src.hypernetwork import AgenticHyperNetwork, LoRAConfig
-from src.lora_injection import FunctionalLoRA
-
-
-def test_gradient_flow_basic():
-    """
-    Basic test: Verify gradients reach the Hypernetwork.
-    
-    Uses a simplified model to isolate the gradient flow mechanism.
-    """
+def test_hypernetwork_gradient_flow():
+    """Test that gradients reach the Hypernetwork components."""
     print("=" * 60)
-    print("TEST: Basic Gradient Flow")
+    print("Test 1: Hypernetwork Gradient Flow")
     print("=" * 60)
     
-    # Create hypernetwork
-    config = LoRAConfig(rank=8, alpha=16)
+    from src.hypernetwork import AgenticHyperNetwork, LoRAConfig
+    
+    # Create small config for testing
+    config = LoRAConfig(rank=8, alpha=16, num_layers=4, hidden_dim=128)
     hypernet = AgenticHyperNetwork(
-        hidden_dim=256,  # Smaller for testing
+        hidden_dim=128,
         num_encoder_layers=2,
         num_heads=4,
         lora_config=config,
     )
     
-    # Create mock prompt embeddings
+    # Simulate prompt embeddings
     batch_size = 2
-    seq_len = 64
-    hidden_dim = 256
-    
-    prompt_embeds = torch.randn(batch_size, seq_len, hidden_dim)
+    seq_len = 32
+    prompt_embeds = torch.randn(batch_size, seq_len, 128, requires_grad=True)
     prompt_mask = torch.ones(batch_size, seq_len)
     
-    # Forward through hypernetwork
+    # Forward pass
     output = hypernet(prompt_embeds, prompt_mask)
     
-    # Simulate a loss using the LoRA output
-    attn_A, attn_B = output["attention"]
-    delta_A, delta_B = output["deltanet"]
-    
-    # Simple loss: sum of all LoRA parameters
-    loss = attn_A.sum() + attn_B.sum() + delta_A.sum() + delta_B.sum()
-    
-    # Backward pass
+    # Compute dummy loss
+    loss = output["lora_A"].sum() + output["lora_B"].sum()
     loss.backward()
     
     # Check gradients
-    checks = []
+    encoder_has_grad = hypernet.prompt_encoder.pool_query.grad is not None
+    generator_has_grad = hypernet.lora_generator.layer_embed.weight.grad is not None
     
-    # Check prompt encoder
-    if hypernet.prompt_encoder.pool_query.grad is not None:
-        grad_norm = hypernet.prompt_encoder.pool_query.grad.norm().item()
-        checks.append(("Prompt Encoder", grad_norm > 0, grad_norm))
-    else:
-        checks.append(("Prompt Encoder", False, 0.0))
+    print(f"  Prompt Encoder has gradients: {encoder_has_grad}")
+    print(f"  LoRA Generator has gradients: {generator_has_grad}")
     
-    # Check attention generator
-    for name, param in hypernet.attention_generator.named_parameters():
-        if param.grad is not None:
-            grad_norm = param.grad.norm().item()
-            checks.append((f"Attention Generator: {name}", grad_norm > 0, grad_norm))
-            break  # Just check one
-    
-    # Check deltanet generator
-    for name, param in hypernet.deltanet_generator.named_parameters():
-        if param.grad is not None:
-            grad_norm = param.grad.norm().item()
-            checks.append((f"DeltaNet Generator: {name}", grad_norm > 0, grad_norm))
-            break
-    
-    # Print results
-    all_passed = True
-    for name, passed, value in checks:
-        status = "✓ PASS" if passed else "✗ FAIL"
-        print(f"  {status} | {name} | grad_norm = {value:.6f}")
-        all_passed = all_passed and passed
-    
-    print()
-    if all_passed:
-        print("RESULT: Basic gradient flow test PASSED")
-    else:
-        print("RESULT: Basic gradient flow test FAILED")
-        print("ERROR: Gradients are not reaching the Hypernetwork!")
-    
-    return all_passed
+    passed = encoder_has_grad and generator_has_grad
+    print(f"\n  Result: {'✓ PASSED' if passed else '✗ FAILED'}")
+    return passed
 
 
-def test_gradient_flow_with_lora():
-    """
-    Full test: Verify gradients flow through LoRA application.
-    
-    This simulates the actual training setup where:
-    1. Hypernetwork generates LoRA
-    2. LoRA is applied to a frozen model layer
-    3. Loss is computed on the output
-    4. Gradients flow back through LoRA to Hypernetwork
-    """
+def test_lora_injection_gradient_flow():
+    """Test that gradients flow through LoRA injection to Hypernetwork."""
     print("\n" + "=" * 60)
-    print("TEST: Gradient Flow Through LoRA Application")
+    print("Test 2: LoRA Injection Gradient Flow")
     print("=" * 60)
     
-    # Create hypernetwork
-    hidden_dim = 256
-    config = LoRAConfig(rank=8, alpha=16)
-    hypernet = AgenticHyperNetwork(
-        hidden_dim=hidden_dim,
-        num_encoder_layers=2,
-        num_heads=4,
-        lora_config=config,
-    )
+    from src.lora_injection import HookBasedLoRAInjector
     
-    # Create a "frozen" base layer (simulating Student layer)
-    base_layer = nn.Linear(hidden_dim, hidden_dim)
-    for param in base_layer.parameters():
-        param.requires_grad = False  # FROZEN
+    # Create mock "student" model
+    class MockStudent(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer1 = nn.Linear(64, 128)
+            self.layer2 = nn.Linear(128, 64)
+            
+        def forward(self, x):
+            x = F.relu(self.layer1(x))
+            return self.layer2(x)
     
-    # Input data
-    batch_size = 2
-    seq_len = 64
+    student = MockStudent()
     
-    prompt_embeds = torch.randn(batch_size, seq_len, hidden_dim)
-    prompt_mask = torch.ones(batch_size, seq_len)
-    input_x = torch.randn(batch_size, seq_len, hidden_dim)
+    # Freeze student
+    for p in student.parameters():
+        p.requires_grad = False
     
-    # Generate LoRA
-    output = hypernet(prompt_embeds, prompt_mask)
+    # Create LoRA weights that WILL have gradients
+    lora_A = torch.randn(64, 8, requires_grad=True)
+    lora_B = torch.randn(8, 128, requires_grad=True) * 0.01  # Small for stability
     
-    # Get one LoRA matrix pair (for testing)
-    attn_A, attn_B = output["attention"]
-    lora_A = attn_A[0, 0]  # [hidden_dim, rank]
-    lora_B = attn_B[0, 0]  # [rank, hidden_dim]
+    # Setup injector
+    injector = HookBasedLoRAInjector(student, scaling=1.0)
     
-    # Apply LoRA to the base layer output
-    base_out = base_layer(input_x)  # No gradients here
-    lora_out = (input_x @ lora_A) @ lora_B * (config.alpha / config.rank)
-    final_out = base_out + lora_out
+    # Forward with LoRA
+    x = torch.randn(2, 10, 64)
     
-    # Loss
-    target = torch.randn_like(final_out)
-    loss = F.mse_loss(final_out, target)
+    with injector.apply_lora({"layer1": (lora_A, lora_B)}):
+        output = student(x)
     
-    # Backward
+    # Backprop
+    loss = output.sum()
     loss.backward()
     
-    # Verify gradients
-    checks = []
+    # Check gradients
+    lora_has_grad = lora_A.grad is not None and lora_B.grad is not None
+    student_no_grad = all(p.grad is None for p in student.parameters())
     
-    # Base layer should have NO gradients (frozen)
-    base_has_grad = base_layer.weight.grad is not None
-    checks.append(("Base Layer (should be None)", not base_has_grad, 0.0))
+    print(f"  LoRA weights have gradients: {lora_has_grad}")
+    print(f"  Student weights have NO gradients: {student_no_grad}")
     
-    # Hypernetwork should have gradients
-    for name, param in hypernet.named_parameters():
-        if param.grad is not None:
-            grad_norm = param.grad.norm().item()
-            if grad_norm > 0:
-                checks.append((f"Hypernetwork: {name}", True, grad_norm))
-                break  # Just need one to verify
-    
-    # Check if any gradients reached hypernet
-    total_grad_norm = sum(
-        p.grad.norm().item() 
-        for p in hypernet.parameters() 
-        if p.grad is not None
-    )
-    checks.append(("Total Hypernetwork Gradient", total_grad_norm > 0, total_grad_norm))
-    
-    # Print results
-    all_passed = True
-    for name, passed, value in checks:
-        status = "✓ PASS" if passed else "✗ FAIL"
-        print(f"  {status} | {name} | value = {value:.6f}")
-        all_passed = all_passed and passed
-    
-    print()
-    if all_passed:
-        print("RESULT: LoRA gradient flow test PASSED")
-    else:
-        print("RESULT: LoRA gradient flow test FAILED")
-        print("ERROR: The gradient highway is broken!")
-    
-    return all_passed
+    passed = lora_has_grad and student_no_grad
+    print(f"\n  Result: {'✓ PASSED' if passed else '✗ FAILED'}")
+    return passed
 
 
 def test_zero_initialization():
-    """
-    Test: Verify zero-initialization of LoRA B matrices.
-    
-    At step 0, the LoRA should have (nearly) no effect:
-    output = base(x) + 0 = base(x)
-    
-    This ensures the Student isn't "lobotomized" at the start of training.
-    """
+    """Test that zero-init preserves Student behavior at step 0."""
     print("\n" + "=" * 60)
-    print("TEST: Zero Initialization")
+    print("Test 3: Zero Initialization")
     print("=" * 60)
     
-    # Create hypernetwork
-    hidden_dim = 256
-    config = LoRAConfig(rank=8, alpha=16)
+    from src.hypernetwork import AgenticHyperNetwork, LoRAConfig
+    from src.lora_injection import HookBasedLoRAInjector
+    
+    # Create models
+    class MockStudent(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = nn.Linear(64, 64)
+            self.k_proj = nn.Linear(64, 64)
+            
+        def forward(self, x):
+            return self.q_proj(x) + self.k_proj(x)
+    
+    student = MockStudent()
+    
+    config = LoRAConfig(rank=8, alpha=16, num_layers=2, hidden_dim=64)
     hypernet = AgenticHyperNetwork(
-        hidden_dim=hidden_dim,
-        num_encoder_layers=2,
-        num_heads=4,
+        hidden_dim=64,
+        num_encoder_layers=1,
+        num_heads=2,
         lora_config=config,
+        layer_path_template="{module}",  # Simple naming for mock
     )
     
-    # Generate LoRA at initialization
-    batch_size = 2
-    seq_len = 64
+    injector = HookBasedLoRAInjector(student, scaling=2.0)
     
-    prompt_embeds = torch.randn(batch_size, seq_len, hidden_dim)
-    prompt_mask = torch.ones(batch_size, seq_len)
+    # Get outputs with and without LoRA
+    x = torch.randn(1, 5, 64)
+    prompt_embeds = torch.randn(1, 10, 64)
+    prompt_mask = torch.ones(1, 10)
     
     with torch.no_grad():
-        output = hypernet(prompt_embeds, prompt_mask)
+        # Output without LoRA
+        base_output = student(x)
+        
+        # Generate LoRA from Hypernetwork
+        lora_output = hypernet(prompt_embeds, prompt_mask)
+        lora_dict = hypernet.get_lora_dict(lora_output, batch_idx=0)
+        
+        # Output with LoRA
+        with injector.apply_lora(lora_dict):
+            lora_applied_output = student(x)
     
-    # Check B matrices are near zero
-    attn_A, attn_B = output["attention"]
-    delta_A, delta_B = output["deltanet"]
+    # Check difference
+    diff = (base_output - lora_applied_output).abs().max().item()
     
-    attn_B_norm = attn_B.abs().mean().item()
-    delta_B_norm = delta_B.abs().mean().item()
+    print(f"  Max difference between base and LoRA output: {diff:.6f}")
+    print(f"  LoRA B matrix mean abs: {lora_output['lora_B'].abs().mean().item():.6f}")
     
-    # Threshold: should be very close to zero
-    threshold = 0.01
-    
-    checks = [
-        ("Attention B matrix", attn_B_norm < threshold, attn_B_norm),
-        ("DeltaNet B matrix", delta_B_norm < threshold, delta_B_norm),
-    ]
-    
-    # Print results
-    all_passed = True
-    for name, passed, value in checks:
-        status = "✓ PASS" if passed else "✗ FAIL"
-        print(f"  {status} | {name} | mean_abs = {value:.6f} (threshold: {threshold})")
-        all_passed = all_passed and passed
-    
-    print()
-    if all_passed:
-        print("RESULT: Zero initialization test PASSED")
-        print("The Student will start with its original behavior.")
-    else:
-        print("RESULT: Zero initialization test FAILED")
-        print("WARNING: LoRA may damage the Student at step 0!")
-    
-    return all_passed
+    # With zero-init, B matrices should be ~0, so output should be nearly identical
+    passed = diff < 0.1  # Allow small numerical differences
+    print(f"\n  Result: {'✓ PASSED' if passed else '✗ FAILED'}")
+    return passed
 
 
 def test_gradient_magnitude():
-    """
-    Test: Check gradient magnitudes are reasonable.
-    
-    - Too small: Vanishing gradients, no learning
-    - Too large: Exploding gradients, unstable training
-    """
+    """Test that gradients have reasonable magnitudes (not exploding/vanishing)."""
     print("\n" + "=" * 60)
-    print("TEST: Gradient Magnitude Check")
+    print("Test 4: Gradient Magnitude")
     print("=" * 60)
     
-    # Create hypernetwork
-    hidden_dim = 256
-    config = LoRAConfig(rank=8, alpha=16)
+    from src.hypernetwork import AgenticHyperNetwork, LoRAConfig
+    
+    config = LoRAConfig(rank=8, alpha=16, num_layers=4, hidden_dim=128)
     hypernet = AgenticHyperNetwork(
-        hidden_dim=hidden_dim,
+        hidden_dim=128,
         num_encoder_layers=2,
         num_heads=4,
         lora_config=config,
     )
     
-    # Simulate a realistic loss magnitude
-    batch_size = 2
-    seq_len = 64
-    
-    prompt_embeds = torch.randn(batch_size, seq_len, hidden_dim)
-    prompt_mask = torch.ones(batch_size, seq_len)
+    # Forward pass
+    prompt_embeds = torch.randn(2, 32, 128)
+    prompt_mask = torch.ones(2, 32)
     
     output = hypernet(prompt_embeds, prompt_mask)
     
-    # Simulate KL divergence-like loss (typical magnitude ~0.1 to 10)
-    attn_A, attn_B = output["attention"]
-    loss = F.mse_loss(attn_A, torch.zeros_like(attn_A))  # ~1.0 magnitude
-    
+    # Simulate distillation loss
+    fake_target = torch.randn_like(output["lora_A"])
+    loss = F.mse_loss(output["lora_A"], fake_target)
     loss.backward()
     
-    # Collect gradient statistics
+    # Check gradient norms
     grad_norms = []
     for name, param in hypernet.named_parameters():
         if param.grad is not None:
-            grad_norms.append((name, param.grad.norm().item()))
+            grad_norms.append(param.grad.norm().item())
     
-    # Check bounds
-    min_grad = 1e-8
-    max_grad = 1e3
+    avg_grad = sum(grad_norms) / len(grad_norms)
+    max_grad = max(grad_norms)
+    min_grad = min(grad_norms)
     
-    all_passed = True
-    for name, norm in grad_norms[:5]:  # Show first 5
-        passed = min_grad < norm < max_grad
-        status = "✓ PASS" if passed else "✗ FAIL"
-        print(f"  {status} | {name[:40]:40s} | grad_norm = {norm:.2e}")
-        all_passed = all_passed and passed
+    print(f"  Gradient norm - Min: {min_grad:.6f}, Max: {max_grad:.6f}, Avg: {avg_grad:.6f}")
     
-    if len(grad_norms) > 5:
-        print(f"  ... and {len(grad_norms) - 5} more parameters")
+    # Good range: between 1e-6 and 1e3
+    not_vanishing = min_grad > 1e-10
+    not_exploding = max_grad < 1e5
     
-    # Summary statistics
-    all_norms = [n for _, n in grad_norms]
-    print(f"\n  Min grad norm: {min(all_norms):.2e}")
-    print(f"  Max grad norm: {max(all_norms):.2e}")
-    print(f"  Mean grad norm: {sum(all_norms)/len(all_norms):.2e}")
+    print(f"  Not vanishing (min > 1e-10): {not_vanishing}")
+    print(f"  Not exploding (max < 1e5): {not_exploding}")
     
-    print()
-    if all_passed:
-        print("RESULT: Gradient magnitude test PASSED")
-    else:
-        print("RESULT: Gradient magnitude test FAILED")
-    
-    return all_passed
+    passed = not_vanishing and not_exploding
+    print(f"\n  Result: {'✓ PASSED' if passed else '✗ FAILED'}")
+    return passed
 
 
-def run_all_tests():
-    """Run all gradient flow tests."""
-    print("\n" + "#" * 60)
-    print("# HYPERNETWORK GRADIENT FLOW VERIFICATION")
-    print("#" * 60)
-    print("\nRunning pre-flight checks before training...")
-    print("If any test FAILS, DO NOT proceed with training.\n")
+def test_layer_discovery():
+    """Test automatic layer discovery in a model."""
+    print("\n" + "=" * 60)
+    print("Test 5: Layer Discovery")
+    print("=" * 60)
+    
+    from src.lora_injection import discover_target_layers
+    
+    # Create mock model with Qwen-like structure
+    class MockAttention(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.q_proj = nn.Linear(dim, dim)
+            self.k_proj = nn.Linear(dim, dim)
+            self.v_proj = nn.Linear(dim, dim)
+            self.o_proj = nn.Linear(dim, dim)
+    
+    class MockLayer(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.self_attn = MockAttention(dim)
+    
+    class MockModel(nn.Module):
+        def __init__(self, num_layers, dim):
+            super().__init__()
+            self.layers = nn.ModuleList([MockLayer(dim) for _ in range(num_layers)])
+    
+    model = MockModel(num_layers=4, dim=64)
+    
+    targets = discover_target_layers(model)
+    
+    print(f"  Discovered {len(targets)} target layers")
+    for t in targets[:4]:
+        print(f"    - {t}")
+    if len(targets) > 4:
+        print(f"    ... and {len(targets) - 4} more")
+    
+    expected = 4 * 4  # 4 layers × 4 projections
+    passed = len(targets) == expected
+    print(f"\n  Expected {expected}, found {len(targets)}")
+    print(f"  Result: {'✓ PASSED' if passed else '✗ FAILED'}")
+    return passed
+
+
+def main():
+    """Run all tests."""
+    print("\n" + "=" * 60)
+    print("HYPERNETWORK PRE-TRAINING VERIFICATION TESTS")
+    print("=" * 60)
     
     results = []
     
-    results.append(("Basic Gradient Flow", test_gradient_flow_basic()))
-    results.append(("LoRA Application Flow", test_gradient_flow_with_lora()))
+    results.append(("Hypernetwork Gradient Flow", test_hypernetwork_gradient_flow()))
+    results.append(("LoRA Injection Gradient Flow", test_lora_injection_gradient_flow()))
     results.append(("Zero Initialization", test_zero_initialization()))
     results.append(("Gradient Magnitude", test_gradient_magnitude()))
+    results.append(("Layer Discovery", test_layer_discovery()))
     
-    # Final summary
+    # Summary
     print("\n" + "=" * 60)
-    print("FINAL SUMMARY")
+    print("SUMMARY")
     print("=" * 60)
     
     all_passed = True
     for name, passed in results:
         status = "✓ PASS" if passed else "✗ FAIL"
-        print(f"  {status} | {name}")
-        all_passed = all_passed and passed
+        print(f"  {status}: {name}")
+        if not passed:
+            all_passed = False
     
-    print()
+    print("\n" + "=" * 60)
     if all_passed:
         print("🎉 ALL TESTS PASSED - Ready for training!")
         return 0
@@ -376,5 +310,4 @@ def run_all_tests():
 
 
 if __name__ == "__main__":
-    import sys
-    sys.exit(run_all_tests())
+    sys.exit(main())

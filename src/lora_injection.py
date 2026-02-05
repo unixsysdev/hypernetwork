@@ -1,72 +1,82 @@
 """
-LoRA Injection Module for Dynamic Weight Application.
+LoRA Injection Module v2 - Hook-Based Implementation.
 
-This module handles the injection of Hypernetwork-generated LoRA weights
-into the frozen Student model during the forward pass.
+This fixes the fragile forward-method replacement with proper forward hooks.
 
-The key insight is that we DON'T modify the Student's actual weights.
-Instead, we intercept the forward pass and add the LoRA delta:
-    output = base_layer(x) + (x @ A) @ B * scaling
-    
-This keeps the Student frozen while allowing gradients to flow through
-the LoRA weights back to the Hypernetwork.
+Key changes:
+1. Uses register_forward_hook to ADD LoRA delta (not replace forward)
+2. Autograd-safe: gradients flow through the addition naturally
+3. Works with fused kernels and any model architecture
 """
 
-from typing import Dict, Tuple, Optional, Callable, Any
-from functools import partial
+from typing import Dict, Tuple, Optional, Callable, List, Any
+from contextlib import contextmanager
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-class LoRALinear(nn.Module):
-    """
-    A wrapper that applies LoRA to a frozen linear layer.
-    
-    During forward:
-        y = base_linear(x) + (x @ A) @ B * scaling
-        
-    The base_linear is frozen, but A and B receive gradients.
-    """
-    
-    def __init__(
-        self,
-        base_linear: nn.Linear,
-        lora_A: torch.Tensor,
-        lora_B: torch.Tensor,
-        scaling: float = 1.0,
-    ):
-        super().__init__()
-        self.base_linear = base_linear
-        self.lora_A = lora_A  # [in_features, rank]
-        self.lora_B = lora_B  # [rank, out_features]
-        self.scaling = scaling
-        
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Base output (no gradients through base weights)
-        base_out = self.base_linear(x)
-        
-        # LoRA delta: (x @ A) @ B * scaling
-        # x: [..., in_features]
-        # A: [in_features, rank]
-        # B: [rank, out_features]
-        lora_out = (x @ self.lora_A) @ self.lora_B * self.scaling
-        
-        return base_out + lora_out
+def get_module_by_name(model: nn.Module, name: str) -> Optional[nn.Module]:
+    """Get a submodule by its dot-separated name."""
+    parts = name.split(".")
+    module = model
+    for part in parts:
+        if hasattr(module, part):
+            module = getattr(module, part)
+        elif part.isdigit() and hasattr(module, '__getitem__'):
+            module = module[int(part)]
+        else:
+            return None
+    return module
 
 
-class LoRAInjector:
+def make_lora_hook(
+    lora_A: torch.Tensor,
+    lora_B: torch.Tensor,
+    scaling: float = 1.0,
+) -> Callable:
     """
-    Manages the injection of LoRA weights into a model.
+    Create a forward hook that ADDS LoRA delta to the output.
+    
+    This is autograd-safe because:
+    - We don't modify the forward function
+    - We just add to the output tensor
+    - Gradients flow through addition naturally
+    
+    Args:
+        lora_A: [in_features, rank] - Down projection
+        lora_B: [rank, out_features] - Up projection  
+        scaling: alpha / rank
+    
+    Returns:
+        Hook function compatible with register_forward_hook
+    """
+    def hook(module: nn.Module, input: Tuple[torch.Tensor, ...], output: torch.Tensor) -> torch.Tensor:
+        # input is a tuple, first element is the actual input tensor
+        x = input[0]  # [batch, seq, in_features]
+        
+        # LoRA computation: (x @ A) @ B * scaling
+        # A: [in_features, rank], B: [rank, out_features]
+        lora_delta = (x @ lora_A) @ lora_B * scaling
+        
+        # ADD to output, don't replace
+        return output + lora_delta
+    
+    return hook
+
+
+class HookBasedLoRAInjector:
+    """
+    Manages LoRA injection via forward hooks.
     
     Usage:
-        injector = LoRAInjector(model, lora_config)
+        injector = HookBasedLoRAInjector(student_model)
         
-        # During forward pass:
-        with injector.inject(lora_weights):
-            output = model(input)
-        # LoRA is automatically removed after the context
+        # Apply LoRA for a forward pass
+        with injector.apply_lora(lora_dict):
+            output = student_model(input_ids)
+        # Hooks automatically removed after context
     """
     
     def __init__(
@@ -76,254 +86,145 @@ class LoRAInjector:
     ):
         self.model = model
         self.scaling = scaling
-        self._hooks = []
-        self._original_forwards = {}
         
-    def _find_module(self, name: str) -> Optional[nn.Module]:
-        """Find a module by its dot-separated name."""
-        parts = name.split(".")
-        module = self.model
-        for part in parts:
-            if hasattr(module, part):
-                module = getattr(module, part)
-            else:
-                return None
-        return module
-    
-    def _create_lora_forward(
+    @contextmanager
+    def apply_lora(
         self,
-        original_forward: Callable,
-        lora_A: torch.Tensor,
-        lora_B: torch.Tensor,
-    ) -> Callable:
-        """Create a new forward function that includes LoRA."""
-        scaling = self.scaling
-        
-        def lora_forward(x: torch.Tensor) -> torch.Tensor:
-            base_out = original_forward(x)
-            lora_out = (x @ lora_A) @ lora_B * scaling
-            return base_out + lora_out
-        
-        return lora_forward
-    
-    def inject(self, lora_dict: Dict[str, Tuple[torch.Tensor, torch.Tensor]]):
-        """
-        Context manager that temporarily injects LoRA weights.
-        
-        Args:
-            lora_dict: Dictionary mapping layer names to (A, B) tuples
-        """
-        return LoRAContext(self, lora_dict)
-
-
-class LoRAContext:
-    """Context manager for temporary LoRA injection."""
-    
-    def __init__(
-        self,
-        injector: LoRAInjector,
         lora_dict: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
     ):
-        self.injector = injector
-        self.lora_dict = lora_dict
-        self._original_forwards = {}
-        
-    def __enter__(self):
-        """Inject LoRA by replacing forward methods."""
-        for name, (lora_A, lora_B) in self.lora_dict.items():
-            module = self.injector._find_module(name)
-            if module is not None and isinstance(module, nn.Linear):
-                # Save original forward
-                self._original_forwards[name] = module.forward
-                
-                # Replace with LoRA forward
-                module.forward = self.injector._create_lora_forward(
-                    module.forward, lora_A, lora_B
-                )
-        return self
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Restore original forward methods."""
-        for name, original_forward in self._original_forwards.items():
-            module = self.injector._find_module(name)
-            if module is not None:
-                module.forward = original_forward
-        return False
-
-
-class FunctionalLoRA:
-    """
-    Functional interface for applying LoRA without modifying the model.
-    
-    This is more efficient for training because it doesn't require
-    repeatedly patching and unpatching the model.
-    """
-    
-    @staticmethod
-    def apply_lora_to_linear(
-        x: torch.Tensor,
-        weight: torch.Tensor,
-        bias: Optional[torch.Tensor],
-        lora_A: torch.Tensor,
-        lora_B: torch.Tensor,
-        scaling: float = 1.0,
-    ) -> torch.Tensor:
         """
-        Apply a linear layer with LoRA in a functional manner.
+        Context manager to temporarily apply LoRA weights.
         
         Args:
-            x: Input tensor [..., in_features]
-            weight: Base weight [out_features, in_features]
-            bias: Optional bias [out_features]
-            lora_A: LoRA A matrix [in_features, rank]
-            lora_B: LoRA B matrix [rank, out_features]
-            scaling: Scaling factor (alpha / rank)
-            
-        Returns:
-            Output tensor [..., out_features]
+            lora_dict: Maps layer names to (lora_A, lora_B) tuples
+                      e.g., {"model.layers.0.self_attn.q_proj": (A, B)}
         """
-        # Base linear
-        base_out = F.linear(x, weight, bias)
+        handles: List[torch.utils.hooks.RemovableHandle] = []
         
-        # LoRA delta
-        lora_out = (x @ lora_A) @ lora_B * scaling
-        
-        return base_out + lora_out
+        try:
+            # Register hooks for each target layer
+            for name, (lora_A, lora_B) in lora_dict.items():
+                module = get_module_by_name(self.model, name)
+                
+                if module is None:
+                    # Module not found - skip silently for now
+                    # TODO: Add warning in debug mode
+                    continue
+                    
+                if not isinstance(module, nn.Linear):
+                    # Only apply to Linear layers
+                    continue
+                
+                hook = make_lora_hook(lora_A, lora_B, self.scaling)
+                handle = module.register_forward_hook(hook)
+                handles.append(handle)
+            
+            yield  # Run the forward pass
+            
+        finally:
+            # Always remove hooks, even if exception occurs
+            for handle in handles:
+                handle.remove()
 
 
-class StudentWithLoRA(nn.Module):
+class BatchedLoRAInjector:
     """
-    Wrapper around the Student model that applies dynamic LoRA.
+    Optimized injector for batched LoRA application.
     
-    The Student's base weights are completely frozen.
-    Only the LoRA weights (from Hypernetwork) receive gradients.
+    Instead of different LoRAs per sample, this applies the same LoRA
+    to all samples in a batch. Use this when prompt context is similar.
     """
     
     def __init__(
         self,
-        student_model: nn.Module,
-        lora_scaling: float = 2.0,
+        model: nn.Module,
+        scaling: float = 2.0,
     ):
-        super().__init__()
-        self.student = student_model
-        self.lora_scaling = lora_scaling
+        self.model = model
+        self.scaling = scaling
+        self._hook_handles: List[torch.utils.hooks.RemovableHandle] = []
+        self._current_lora: Optional[Dict[str, Tuple[torch.Tensor, torch.Tensor]]] = None
         
-        # Freeze the student
-        for param in self.student.parameters():
-            param.requires_grad = False
-            
-        # Mapping from our key format to actual model paths
-        # This needs to be configured based on the actual model architecture
-        self._layer_mapping = {}
-        self._setup_layer_mapping()
+    def set_lora(self, lora_dict: Dict[str, Tuple[torch.Tensor, torch.Tensor]]):
+        """Set the LoRA weights to use for subsequent forward passes."""
+        # Remove old hooks
+        self.clear_lora()
         
-    def _setup_layer_mapping(self):
-        """
-        Set up the mapping from our layer keys to actual model paths.
+        # Register new hooks
+        for name, (lora_A, lora_B) in lora_dict.items():
+            module = get_module_by_name(self.model, name)
+            if module is not None and isinstance(module, nn.Linear):
+                hook = make_lora_hook(lora_A, lora_B, self.scaling)
+                handle = module.register_forward_hook(hook)
+                self._hook_handles.append(handle)
         
-        For Qwen3-Coder-Next, we need to map:
-        - "X.self_attn.q_proj" -> actual attention layer path
-        - "X.deltanet.linear_q" -> actual deltanet layer path
-        """
-        # This will be populated based on the actual model structure
-        # when we load the model
-        pass
-    
-    def get_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Get token embeddings for the prompt."""
-        # Access the embedding layer - path depends on model architecture
-        if hasattr(self.student, 'model'):
-            embed_layer = self.student.model.embed_tokens
-        elif hasattr(self.student, 'transformer'):
-            embed_layer = self.student.transformer.wte
-        else:
-            embed_layer = self.student.get_input_embeddings()
+        self._current_lora = lora_dict
         
-        return embed_layer(input_ids)
-    
-    def forward_with_lora(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        lora_weights: Optional[Dict[str, Tuple[torch.Tensor, torch.Tensor]]] = None,
-    ) -> torch.Tensor:
-        """
-        Forward pass with dynamic LoRA injection.
-        
-        This is the main training interface. The LoRA weights are generated
-        by the Hypernetwork and injected here.
-        
-        Args:
-            input_ids: [B, L] - Input token IDs
-            attention_mask: [B, L] - Attention mask
-            lora_weights: Dict mapping layer names to (A, B) tuples
-            
-        Returns:
-            logits: [B, L, V] - Output logits
-        """
-        if lora_weights is None:
-            # No LoRA, just run the base model
-            outputs = self.student(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-            )
-            return outputs.logits
-        
-        # Apply LoRA via hook-based injection
-        injector = LoRAInjector(self.student, scaling=self.lora_scaling)
-        
-        with injector.inject(lora_weights):
-            outputs = self.student(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-            )
-        
-        return outputs.logits
+    def clear_lora(self):
+        """Remove all LoRA hooks."""
+        for handle in self._hook_handles:
+            handle.remove()
+        self._hook_handles = []
+        self._current_lora = None
 
 
-def create_lora_hooks(
+def discover_target_layers(
     model: nn.Module,
-    lora_weights: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
-    scaling: float = 1.0,
-) -> list:
+    target_names: List[str] = ["q_proj", "k_proj", "v_proj", "o_proj"],
+) -> List[str]:
     """
-    Create forward hooks that apply LoRA to specific layers.
+    Discover all layers in the model that match target names.
     
-    This is an alternative to the context manager approach that might
-    be more efficient for some use cases.
+    This automatically handles the difference between DeltaNet and Attention
+    layers since they both use the same projection names.
     
-    Returns a list of hook handles that should be removed after use.
+    Returns:
+        List of full layer paths, e.g., ["model.layers.0.self_attn.q_proj", ...]
     """
-    hooks = []
-    
-    def make_hook(lora_A: torch.Tensor, lora_B: torch.Tensor):
-        def hook(module, input, output):
-            x = input[0]
-            lora_delta = (x @ lora_A) @ lora_B * scaling
-            return output + lora_delta
-        return hook
+    discovered = []
     
     for name, module in model.named_modules():
-        if name in lora_weights:
-            lora_A, lora_B = lora_weights[name]
-            hook = module.register_forward_hook(make_hook(lora_A, lora_B))
-            hooks.append(hook)
+        # Check if this module's name ends with a target
+        for target in target_names:
+            if name.endswith(target) and isinstance(module, nn.Linear):
+                discovered.append(name)
+                break
     
-    return hooks
+    return discovered
 
 
-def remove_hooks(hooks: list):
-    """Remove all hooks from a list of hook handles."""
-    for hook in hooks:
-        hook.remove()
-
-
-if __name__ == "__main__":
-    # Quick test
-    print("Testing LoRA injection...")
+def create_layer_to_index_mapping(
+    layer_paths: List[str],
+) -> Dict[str, int]:
+    """
+    Create a mapping from layer paths to sequential indices.
     
-    # Create a simple test model
-    class TestModel(nn.Module):
+    This is useful for the Hypernetwork which generates LoRAs in a specific order.
+    """
+    return {path: idx for idx, path in enumerate(sorted(layer_paths))}
+
+
+# For backwards compatibility
+class LoRAInjector(HookBasedLoRAInjector):
+    """Alias for backwards compatibility."""
+    
+    def inject(self, lora_dict):
+        """Backwards-compatible interface."""
+        return self.apply_lora(lora_dict)
+
+
+# =============================================================================
+# Tests
+# =============================================================================
+
+def test_hook_based_injection():
+    """Test that hook-based injection works and gradients flow correctly."""
+    print("=" * 60)
+    print("Testing Hook-Based LoRA Injection")
+    print("=" * 60)
+    
+    # Create a simple model
+    class SimpleModel(nn.Module):
         def __init__(self):
             super().__init__()
             self.layer1 = nn.Linear(64, 128)
@@ -333,33 +234,108 @@ if __name__ == "__main__":
             x = F.relu(self.layer1(x))
             return self.layer2(x)
     
-    model = TestModel()
+    model = SimpleModel()
     
-    # Create test LoRA weights
+    # Freeze the model (simulating frozen student)
+    for p in model.parameters():
+        p.requires_grad = False
+    
+    # Create LoRA weights (these WILL have gradients)
     lora_A = torch.randn(64, 8, requires_grad=True)
-    lora_B = torch.zeros(8, 128, requires_grad=True)  # Zero init
+    lora_B = torch.zeros(8, 128, requires_grad=True)  # Zero-init
     
-    # Test functional LoRA
+    # Create injector
+    injector = HookBasedLoRAInjector(model, scaling=1.0)
+    
+    # Test 1: Forward pass with LoRA
     x = torch.randn(2, 10, 64)
     
-    # Without LoRA
-    base_out = model.layer1(x)
+    with injector.apply_lora({"layer1": (lora_A, lora_B)}):
+        output = model(x)
     
-    # With LoRA (functional)
-    lora_out = FunctionalLoRA.apply_lora_to_linear(
-        x, model.layer1.weight, model.layer1.bias,
-        lora_A, lora_B, scaling=1.0
-    )
+    print(f"✓ Forward pass completed. Output shape: {output.shape}")
     
-    # Since B is zero, outputs should be the same
-    diff = (base_out - lora_out).abs().max().item()
-    print(f"Difference with zero-init B: {diff:.6f} (should be ~0)")
-    
-    # Test gradient flow
-    loss = lora_out.sum()
+    # Test 2: Gradient flow
+    loss = output.sum()
     loss.backward()
     
-    has_grad = lora_A.grad is not None and lora_B.grad is not None
-    print(f"Gradient flow: {'PASSED' if has_grad else 'FAILED'}")
+    lora_A_has_grad = lora_A.grad is not None
+    lora_B_has_grad = lora_B.grad is not None
+    model_has_no_grad = all(p.grad is None for p in model.parameters())
     
-    print("\nLoRA injection tests passed!")
+    print(f"✓ LoRA A has gradient: {lora_A_has_grad}")
+    print(f"✓ LoRA B has gradient: {lora_B_has_grad}")
+    print(f"✓ Model params have no gradient: {model_has_no_grad}")
+    
+    # Test 3: Zero-init behavior
+    lora_A_2 = torch.randn(64, 8)
+    lora_B_2 = torch.zeros(8, 128)  # Zero B means no change
+    
+    with torch.no_grad():
+        base_output = model(x)
+        
+    with torch.no_grad():
+        with injector.apply_lora({"layer1": (lora_A_2, lora_B_2)}):
+            lora_output = model(x)
+    
+    diff = (base_output - lora_output).abs().max().item()
+    print(f"✓ Zero-init B preserves output: diff = {diff:.6f}")
+    
+    # Summary
+    all_passed = lora_A_has_grad and lora_B_has_grad and model_has_no_grad and diff < 1e-5
+    
+    if all_passed:
+        print("\n🎉 ALL TESTS PASSED - Hook-based injection works!")
+    else:
+        print("\n❌ SOME TESTS FAILED")
+    
+    return all_passed
+
+
+def test_layer_discovery():
+    """Test automatic layer discovery."""
+    print("\n" + "=" * 60)
+    print("Testing Layer Discovery")
+    print("=" * 60)
+    
+    # Create a mock Qwen-like structure
+    class MockAttention(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.q_proj = nn.Linear(dim, dim)
+            self.k_proj = nn.Linear(dim, dim)
+            self.v_proj = nn.Linear(dim, dim)
+            self.o_proj = nn.Linear(dim, dim)
+            
+    class MockLayer(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.self_attn = MockAttention(dim)
+            
+    class MockModel(nn.Module):
+        def __init__(self, num_layers, dim):
+            super().__init__()
+            self.layers = nn.ModuleList([MockLayer(dim) for _ in range(num_layers)])
+    
+    model = MockModel(num_layers=4, dim=64)
+    
+    # Discover layers
+    targets = discover_target_layers(model)
+    
+    print(f"Discovered {len(targets)} target layers:")
+    for t in targets[:8]:  # Show first 8
+        print(f"  - {t}")
+    if len(targets) > 8:
+        print(f"  ... and {len(targets) - 8} more")
+    
+    expected = 4 * 4  # 4 layers × 4 projections
+    passed = len(targets) == expected
+    
+    print(f"\n✓ Expected {expected} layers, found {len(targets)}: {'PASS' if passed else 'FAIL'}")
+    
+    return passed
+
+
+if __name__ == "__main__":
+    test_hook_based_injection()
+    test_layer_discovery()

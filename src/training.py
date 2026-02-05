@@ -30,7 +30,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 import wandb
 
 from .hypernetwork import AgenticHyperNetwork, LoRAConfig
-from .lora_injection import LoRAInjector
+from .lora_injection import HookBasedLoRAInjector, discover_target_layers
 from .data_loader import create_dataloader
 
 logger = logging.getLogger(__name__)
@@ -75,6 +75,10 @@ class TrainingConfig:
     # Logging
     wandb_project: str = "hypernetwork-distillation"
     log_every_steps: int = 10
+    
+    # Cached teacher logits (offline distillation)
+    use_cached_teacher: bool = True
+    teacher_cache_dir: str = "./teacher_cache"
 
 
 def top_k_kl_divergence(
@@ -249,11 +253,15 @@ class DistillationTrainer:
         # Setup mixed precision
         self.scaler = GradScaler()
         
-        # Setup LoRA injector
-        self.lora_injector = LoRAInjector(
+        # Setup LoRA injector (new hook-based version)
+        self.lora_injector = HookBasedLoRAInjector(
             self.student,
             scaling=self.config.lora_alpha / self.config.lora_rank,
         )
+        
+        # Discover target layers in student model
+        self.target_layers = discover_target_layers(self.student)
+        logger.info(f"Found {len(self.target_layers)} target layers for LoRA")
         
         logger.info("Setup complete!")
         
@@ -306,8 +314,8 @@ class DistillationTrainer:
         for b in range(batch_size):
             lora_dict = self.hypernetwork.get_lora_dict(lora_output, batch_idx=b)
             
-            # 3. Student forward with LoRA
-            with self.lora_injector.inject(lora_dict):
+            # 3. Student forward with LoRA (using hook-based injection)
+            with self.lora_injector.apply_lora(lora_dict):
                 student_outputs = self.student(
                     input_ids=input_ids[b:b+1],
                     attention_mask=attention_mask[b:b+1],
