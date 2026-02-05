@@ -121,6 +121,8 @@ def setup_vllm_teacher(config: TeacherConfig) -> Any:
         )
     
     # Set visible devices for Teacher
+    # WARNING: This globally modifies the environment. If running Teacher and Student
+    # in the same process, use device placement or process isolation instead.
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, config.devices))
     
     # Initialize vLLM
@@ -136,30 +138,8 @@ def setup_vllm_teacher(config: TeacherConfig) -> Any:
     return llm
 
 
-def get_teacher_logits_vllm(
-    llm: Any,
-    input_ids: torch.Tensor,
-    max_tokens: int = 1,
-) -> torch.Tensor:
-    """
-    Get logits from vLLM Teacher.
-    
-    Note: vLLM is optimized for generation, not scoring.
-    For pure logit extraction, we may need to use the underlying
-    model directly or use a special API.
-    
-    This is a placeholder that shows the intended interface.
-    """
-    # vLLM doesn't directly expose logits in the same way as transformers
-    # For actual implementation, you'd either:
-    # 1. Use vLLM's internal model access
-    # 2. Use a separate scoring endpoint
-    # 3. Fall back to transformers for scoring
-    
-    raise NotImplementedError(
-        "vLLM logit extraction requires custom implementation. "
-        "For now, use the transformers-based Teacher loading in training.py"
-    )
+# NOTE: get_teacher_logits_vllm was removed - vLLM logit extraction is implemented
+# in scripts/cache_teacher_vllm.py using prompt_logprobs instead.
 
 
 def setup_fsdp_student(
@@ -286,8 +266,9 @@ class ProducerConsumerPipeline:
             if not self.use_cuda_ipc:
                 batch["teacher_logits"] = batch["teacher_logits"].cuda()
             
-            # Train step
-            trainer.train_step_with_precomputed_teacher(batch)
+            # Train step (uses standard train_step with teacher_logits in batch)
+            # NOTE: For real usage, adapt batch format to match train_step expectations
+            trainer.train_step(batch)
     
     def stop(self):
         """Signal both threads to stop."""

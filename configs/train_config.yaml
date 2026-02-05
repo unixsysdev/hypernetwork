@@ -72,4 +72,5 @@ checkpointing:
 logging:
   wandb_project: "hypernetwork-distillation"
   wandb_run_name: "qwen3-coder-next-hypernet"
+  wandb_enabled: true  # Set to false to disable wandb
   log_every_steps: 10

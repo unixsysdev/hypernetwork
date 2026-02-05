@@ -352,10 +352,20 @@ class DistillationTrainer:
         student_log_probs = F.log_softmax(student_gathered / temperature, dim=-1)  # [L, K]
         
         # Teacher: values are ALREADY log probs from vLLM!
-        # Just apply temperature scaling to match student
-        teacher_log_probs = teacher_values / temperature  # [L, K]
-        teacher_probs = torch.exp(teacher_log_probs)  # [L, K] - convert to probs for KL
-        teacher_probs = teacher_probs / teacher_probs.sum(dim=-1, keepdim=True)  # Renormalize over top-K
+        # WARNING: Temperature scaling of log-probs is mathematically different from
+        # scaling logits before softmax. For temperature != 1.0, this is an approximation.
+        # Correct approach: cache raw logits, or apply temp during caching.
+        # For now: only apply temp=1.0 passthrough, warn otherwise.
+        if temperature != 1.0:
+            import warnings
+            warnings.warn(
+                f"Temperature={temperature} with cached vLLM log-probs is approximate. "
+                "For accurate temperature scaling, cache raw logits instead.",
+                UserWarning,
+            )
+        # Convert log-probs to probs and renormalize over top-K
+        teacher_probs = torch.exp(teacher_values)  # [L, K]
+        teacher_probs = teacher_probs / teacher_probs.sum(dim=-1, keepdim=True)  # Renormalize
         
         # Compute KL divergence per position: sum_k P(k) * [log P(k) - log Q(k)]
         kl_per_pos = F.kl_div(student_log_probs, teacher_probs, reduction='none').sum(dim=-1)  # [L]
@@ -471,12 +481,14 @@ class DistillationTrainer:
         """
         Optimized training step using parallel forward passes.
         
-        Instead of sequential LoRA application, we:
-        1. Stack all LoRAs into tensors
-        2. Use einsum for batched LoRA delta computation
-        3. Accumulate losses in parallel
+        NOTE: Despite the name, per-sample LoRA application is still sequential
+        due to the need to apply different LoRA weights per sample. The 'parallel'
+        refers to potential future batched einsum optimization, not current impl.
+        True batched LoRA would require fundamentally different architecture.
         
-        This provides ~2-3x speedup over sequential processing.
+        Current optimizations:
+        - Pre-compiled forward function via torch.compile
+        - Loss stacking for single backward pass
         """
         import torch.utils.checkpoint as checkpoint
         
