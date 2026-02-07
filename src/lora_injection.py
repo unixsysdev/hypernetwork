@@ -56,9 +56,13 @@ def make_lora_hook(
         # input is a tuple, first element is the actual input tensor
         x = input[0]  # [batch, seq, in_features]
         
+        # Move LoRA tensors to the module's device (safe for model-parallel sharding)
+        A = lora_A.to(x.device)
+        B = lora_B.to(x.device)
+        
         # LoRA computation: (x @ A) @ B * scaling
         # A: [in_features, rank], B: [rank, out_features]
-        lora_delta = (x @ lora_A) @ lora_B * scaling
+        lora_delta = (x @ A) @ B * scaling
         
         # ADD to output, don't replace
         return output + lora_delta
@@ -89,11 +93,15 @@ def make_batched_lora_hook(
     def hook(module: nn.Module, input: Tuple[torch.Tensor, ...], output: torch.Tensor) -> torch.Tensor:
         x = input[0]  # [B, L, in_features]
         
+        # Move LoRA tensors to the module's device (safe for model-parallel sharding)
+        A = lora_A.to(x.device)
+        B = lora_B.to(x.device)
+        
         # Batched LoRA: each sample gets its own (A, B) matrices
         # intermediate[b,l,r] = sum_d x[b,l,d] * A[b,d,r]
-        intermediate = torch.einsum('bld,bdr->blr', x, lora_A)
+        intermediate = torch.einsum('bld,bdr->blr', x, A)
         # delta[b,l,o] = sum_r intermediate[b,l,r] * B[b,r,o]
-        lora_delta = torch.einsum('blr,bro->blo', intermediate, lora_B) * scaling
+        lora_delta = torch.einsum('blr,bro->blo', intermediate, B) * scaling
         
         return output + lora_delta
     

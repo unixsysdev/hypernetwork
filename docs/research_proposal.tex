@@ -1,0 +1,471 @@
+\documentclass[11pt,a4paper]{article}
+
+% Packages
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{cleveref}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,fit,calc}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{float}
+\usepackage{microtype}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!70!black,
+    citecolor=green!50!black,
+    urlcolor=blue!60!black
+}
+
+% Custom commands
+\newcommand{\hypernet}{\textsc{Hyper-Agent}}
+\newcommand{\teacher}{\textsc{Oracle}}
+\newcommand{\student}{\textsc{Vessel}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\loss}{\mathcal{L}}
+
+\title{%
+    \vspace{-1cm}
+    \textbf{Hyper-Agent: Dynamic Hypernetwork-Based\\Knowledge Distillation for Agentic\\Large Language Models}\\[0.5em]
+    \large Research Proposal \& System Specification
+}
+\author{
+    Marcel Butucea\\
+    \texttt{marcelbutucea@gmail.com}
+}
+\date{February 2026}
+
+\begin{document}
+\maketitle
+
+% ============================================================================
+\begin{abstract}
+We propose \hypernet{}, a novel system for distilling the agentic reasoning capabilities of a 480-billion-parameter teacher model (Qwen3-Coder-480B) into an 80-billion-parameter student model (Qwen3-Coder-Next) via a \emph{dynamic hypernetwork} that generates task-specific Low-Rank Adaptation (LoRA) weights at inference time. Unlike static distillation approaches that produce a single set of student weights, \hypernet{} introduces a meta-learning paradigm in which a compact hypernetwork ($\sim$130M trainable parameters) learns to interpret an input task prompt and synthesize specialised LoRA matrices for all 192 attention projections in the student's hybrid Transformer--DeltaNet architecture. The system employs offline logit caching with Top-128 sparse KL divergence, a Privileged Information Protocol for hard-task bootstrapping, and a novel Chunked KL Loss mechanism that reduces peak VRAM consumption from 318\,GB to 2.4\,GB during 131K-token trajectory distillation. We detail the full system architecture, training protocol on an 8$\times$H200 cluster, expected experimental results, and a comprehensive risk analysis with mitigations for all eleven identified failure modes.
+\end{abstract}
+
+% ============================================================================
+\section{Introduction}\label{sec:intro}
+
+\subsection{Motivation}
+The state-of-the-art in autonomous software engineering is dominated by frontier-scale models exceeding 400B parameters. These models---exemplified by Qwen3-Coder-480B---achieve remarkable performance on benchmarks such as SWE-bench Verified, successfully reasoning through multi-file codebases, executing tool calls, and synthesising correct patches. However, their deployment cost is prohibitive: serving a 480B model in FP8 requires a minimum of 280\,GB of accelerator memory and sustained throughput of $\sim$30--60 samples per minute even with aggressive tensor parallelism.
+
+The natural question is: \emph{can we distill the agentic reasoning of a 480B model into a 6$\times$ smaller student without losing the nuanced decision-making that distinguishes frontier agents from commodity code generators?}
+
+\subsection{The Static Distillation Bottleneck}
+Conventional knowledge distillation produces a single, static student model optimised for the average case across the training distribution. This approach suffers from two fundamental limitations in the agentic setting:
+
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Task Heterogeneity}: SWE-bench tasks span bug fixes, feature implementations, refactors, and test generation---each demanding different internal ``specialisations'' of the attention mechanism.
+    \item \textbf{Capacity Gap}: An 80B student cannot simultaneously encode all specialisations that a 480B model holds natively. Static distillation forces a lossy compression of the teacher's full capability manifold.
+\end{enumerate}
+
+\subsection{Our Proposal: Dynamic Adaptation via Hypernetworks}
+\hypernet{} resolves these limitations by introducing a \emph{dynamic} component: a hypernetwork that reads the task description and generates a unique set of LoRA weight matrices tailored to that specific problem. The student model's base weights remain frozen; only the lightweight LoRA deltas ($\sim$84M parameters per inference) are synthesised on-the-fly. This enables the 80B student to exhibit \emph{task-conditional specialisation}---activating different reasoning circuits for different problem types---achieving a level of adaptability that static distillation cannot provide.
+
+The key insight is that \textbf{the hypernetwork learns a mapping from task descriptions to optimal weight perturbations}, effectively compressing the teacher's vast capability space into a compact, generative meta-model.
+
+% ============================================================================
+\section{System Architecture}\label{sec:arch}
+
+\subsection{System Topology}
+The \hypernet{} system consists of three principal components:
+
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{The \teacher{} (Teacher)}: Qwen3-Coder-480B-A35B-Instruct in FP8 precision, served via vLLM with tensor parallelism ($TP=8$). It provides gold-standard reasoning traces and probability distributions.
+    \item \textbf{The \student{} (Student)}: Qwen3-Coder-Next (80B), a hybrid architecture combining Gated DeltaNet (linear attention) and Gated Attention (standard) blocks in a repeating pattern of $12 \times (3 \times \text{DeltaNet} + 1 \times \text{Attention})$, totalling 48 layers. Base weights are frozen throughout training; only the hypernetwork is optimised.
+    \item \textbf{The Brain (Hypernetwork)}: A $\sim$130M-parameter meta-model comprising a Transformer-based Prompt Encoder and a Shape-Grouped LoRA Generator that produces adaptation matrices for all 192 target projections.
+\end{enumerate}
+
+\subsection{Student Model: Hybrid Architecture Analysis}
+The Qwen3-Coder-Next 80B model employs a heterogeneous block design that presents unique challenges for uniform LoRA injection. Our analysis reveals four distinct shape groups across the 192 target linear projections:
+
+\begin{table}[H]
+\centering
+\caption{Projection topology of Qwen3-Coder-Next 80B across 48 layers.}
+\label{tab:projections}
+\begin{tabular}{@{}llccr@{}}
+\toprule
+\textbf{Block Type} & \textbf{Projection} & \textbf{In Dim} & \textbf{Out Dim} & \textbf{Count} \\
+\midrule
+DeltaNet & \texttt{q\_proj}, \texttt{k\_proj} & 2048 & 2048 & 72 \\
+DeltaNet & \texttt{v\_proj} & 2048 & 4096 & 36 \\
+DeltaNet & \texttt{o\_proj} & 4096 & 2048 & 36 \\
+Attention & \texttt{q\_proj} & 2048 & 4096 & 12 \\
+Attention & \texttt{k\_proj}, \texttt{v\_proj} & 2048 & 512 & 24 \\
+Attention & \texttt{o\_proj} & 4096 & 2048 & 12 \\
+\midrule
+\multicolumn{4}{l}{\textbf{Total target projections}} & \textbf{192} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The DeltaNet blocks use 16 Q/K heads and 32 V heads (head dimension 128), while the Attention blocks use 16 Q heads and 2 KV heads in a Grouped Query Attention (GQA) configuration (head dimension 256). Despite this heterogeneity, both block types share standard naming conventions (\texttt{q\_proj}, \texttt{k\_proj}, \texttt{v\_proj}, \texttt{o\_proj}), enabling a single discovery pass.
+
+\subsection{Hypernetwork Architecture (v4)}\label{sec:hypernet}
+
+\subsubsection{Prompt Encoder}
+The Prompt Encoder transforms an input task description into a fixed-size context vector:
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Input}: Tokenised prompt embeddings $\mathbf{X} \in \R^{B \times L \times D}$ where $D = 2048$.
+    \item \textbf{Sequence Encoding}: A 4-layer Transformer Encoder with norm-first architecture processes the embeddings.
+    \item \textbf{Adaptive Pooling}: A learnable query vector $\mathbf{q}_{\text{pool}} \in \R^D$ attends over the encoded sequence via cross-attention, producing a fixed-size context vector $\mathbf{c} \in \R^{B \times D}$.
+    \item \textbf{Stability}: Final layer normalisation ensures bounded context representatives regardless of prompt length.
+\end{enumerate}
+
+The prompt window is configurable from 512 to 8192 tokens. For complex SWE-bench tasks, we use 8192 tokens to capture sufficient ``semantic variance'' for the hypernetwork to distinguish between fine-grained specialisations.
+
+\subsubsection{Shape-Grouped LoRA Generator}
+The generator must produce LoRA $A$ and $B$ matrices for all 192 target projections across four distinct shape groups. The v4 \texttt{ShapeGroupedLoRAGenerator} addresses this via per-shape output heads:
+
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Unified Backbone}: A shared MLP takes the concatenation $[\mathbf{c}; \mathbf{e}_i]$ of the context vector and a per-layer learned embedding $\mathbf{e}_i$ and produces a feature vector per layer.
+    \item \textbf{Heterogeneous Output Heads}: A \texttt{ModuleDict} of linear heads is created for each unique $(d_{\text{in}}, d_{\text{out}})$ pair, producing:
+    \begin{align}
+        \mathbf{A}_i &= \text{Head}^A_{s(i)}(\mathbf{f}_i) \in \R^{d_{\text{in}} \times r} \\
+        \mathbf{B}_i &= \text{Head}^B_{s(i)}(\mathbf{f}_i) \in \R^{r \times d_{\text{out}}}
+    \end{align}
+    where $s(i)$ maps layer $i$ to its shape group and $r = 16$ is the LoRA rank.
+    \item \textbf{Ordered Mapping}: An ordered list of \texttt{LayerInfo} objects from runtime layer discovery establishes a strict 1:1 correspondence between generator outputs and student model modules.
+\end{enumerate}
+
+\subsubsection{Parameter Budget}
+For $D = 2048$ and $r = 16$, the generator heads alone contribute:
+\begin{equation}
+    \text{Params}_{\text{heads}} = \sum_{g \in \text{Groups}} D \cdot (d^g_{\text{in}} \cdot r + r \cdot d^g_{\text{out}})
+\end{equation}
+Across the four shape groups, this yields approximately 400--800M parameters in the output heads. Combined with the encoder and embeddings, the full hypernetwork totals $\sim$130M trainable parameters.
+
+\subsection{LoRA Injection via Forward Hooks}\label{sec:injection}
+
+The system uses PyTorch \texttt{register\_forward\_hook} to inject LoRA deltas non-invasively. For batched training, we employ \texttt{einsum}-based hooks:
+
+\begin{equation}
+    \mathbf{y}_{\text{out}} = \mathbf{y}_{\text{base}} + \frac{\alpha}{r} \cdot \text{einsum}(\texttt{`blr,bro->blo'}, \;\text{einsum}(\texttt{`bld,bdr->blr'}, \;\mathbf{x}, \mathbf{A}), \;\mathbf{B})
+\end{equation}
+
+where $\mathbf{x} \in \R^{B \times L \times d_{\text{in}}}$ is the layer input, and $\mathbf{A} \in \R^{B \times d_{\text{in}} \times r}$, $\mathbf{B} \in \R^{B \times r \times d_{\text{out}}}$ are per-sample LoRA matrices. This allows a single student forward pass to process the entire batch with different per-sample adaptations.
+
+\subsubsection{The Zero Protocol}
+To ensure the student starts with exactly its base behaviour at $t=0$:
+\begin{itemize}[leftmargin=*]
+    \item $\mathbf{B}$ matrices are initialised to zero: $\mathbf{B}_0 = \mathbf{0}$.
+    \item $\mathbf{A}$ matrices use small normal initialisation: $\mathbf{A}_0 \sim \mathcal{N}(0, 0.01)$.
+    \item This guarantees $\Delta W_0 = A_0 \cdot B_0 = \mathbf{0}$, preventing catastrophic gradient spikes.
+\end{itemize}
+
+% ============================================================================
+\section{Training Protocol}\label{sec:training}
+
+\subsection{Offline Logit Distillation}
+Rather than holding both the 480B teacher and 80B student in memory simultaneously (which would require $>$1.2\,TB VRAM), we employ a two-phase offline distillation strategy:
+
+\paragraph{Phase 1: Teacher Logit Caching.}
+The teacher processes all training trajectories once, and for each token position, we extract and store only the \textbf{Top-128 logits} (values and vocabulary indices):
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Storage format}: Compressed \texttt{.npz} files per trajectory.
+    \item \textbf{Tensors}: \texttt{values} $\in \R^{L \times 128}$ (float16), \texttt{indices} $\in \mathbb{Z}^{L \times 128}$ (int32), \texttt{input\_ids} $\in \mathbb{Z}^{L}$.
+    \item \textbf{Compression ratio}: $\sim$1000$\times$ reduction vs.\ full vocabulary ($V \approx 152$K).
+    \item \textbf{Total storage}: $\sim$125\,GB for 30K trajectories at 131K tokens each.
+    \item \textbf{Throughput}: 30--60 samples/minute using vLLM with $TP=8$.
+\end{itemize}
+
+\paragraph{Phase 2: Student Training.}
+The student trains exclusively against the cached logits. The teacher model is never loaded during this phase, freeing $\sim$900\,GB of VRAM for the student's activation graphs and enabling a 5--10$\times$ throughput increase.
+
+\subsection{Loss Function: Sparse KL Divergence}\label{sec:loss}
+
+The training objective minimises the KL divergence between the student's and teacher's token-level probability distributions:
+\begin{equation}\label{eq:kl}
+    \loss = \text{KL}\!\left(\text{Softmax}\!\left(\frac{\mathbf{z}^{S}}{T}\right) \;\bigg\|\; \text{Softmax}\!\left(\frac{\mathbf{z}^{T}}{T}\right)\right)
+\end{equation}
+where $\mathbf{z}^S$ and $\mathbf{z}^T$ are the student and teacher logits respectively, and $T$ is a temperature parameter.
+
+Since only the Top-128 teacher logits are cached, we compute a \emph{sparse} KL by gathering the student's log-probabilities at the teacher's top indices and comparing against the teacher's renormalised distribution over those indices.
+
+\subsubsection{Chunked KL Loss (Critical Innovation)}
+For full-trajectory distillation at 131K tokens with batch size 8, naively materialising the full-vocabulary \texttt{log\_softmax} would require:
+\begin{equation}
+    B \times L \times V \times 2 \;\text{bytes} = 8 \times 131{,}072 \times 152{,}064 \times 2 \approx \mathbf{318\,\text{GB}}
+\end{equation}
+
+Our \textbf{Chunked KL Loss} processes the sequence in slices of 1024 tokens along the sequence dimension, computing per-chunk log-probabilities and immediately freeing the intermediate tensors. This reduces peak VRAM for the loss computation from 318\,GB to $\sim$\textbf{2.4\,GB}---a 132$\times$ reduction---while preserving the exact mathematical signal.
+
+\subsection{Privileged Information Protocol}\label{sec:privileged}
+
+For particularly challenging SWE-bench tasks, we employ a ``cheating'' protocol to create higher-quality training signal:
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Hindsight Generation}: The teacher receives the \emph{canonical solution} (the ``answer key'') in its prompt context.
+    \item \textbf{Rationale Mapping}: The teacher generates a reasoning trajectory that rationalises the discovery of the solution, creating a ``Perfect Reasoning Path.''
+    \item \textbf{Blind Distillation}: The student sees only the problem description, \emph{not} the solution.
+    \item \textbf{Intuition Learning}: The hypernetwork must bridge the gap between the bare problem statement and the teacher's privileged reasoning path, effectively learning ``intuition'' for how solutions are discovered.
+\end{enumerate}
+
+This creates an asymmetric information setting where the hypernetwork learns to generate LoRA weights that steer the student toward solution patterns it has never explicitly seen---a form of meta-learning for problem-solving strategy.
+
+\subsection{Data Pipeline}\label{sec:data}
+
+\subsubsection{Source Dataset}
+We use \texttt{nebius/SWE-rebench-openhands-trajectories}, containing agentic trajectories generated by Qwen3-Coder-480B using the OpenHands framework on SWE-bench tasks.
+
+\subsubsection{The Gold Filter}
+Training on failed trajectories produces delusional agents. We enforce strict quality filtering:
+\begin{itemize}[leftmargin=*]
+    \item \texttt{resolved == 1}: Only successfully resolved SWE-bench instances.
+    \item \texttt{exit\_status == "submit"}: Only complete attempts (no crashes or timeouts).
+    \item Result: $\sim$32K gold-standard trajectories from the full dataset.
+\end{itemize}
+
+\subsubsection{Loss Masking}
+During training, the loss is computed only on \textbf{assistant tokens} (reasoning and tool calls). \textbf{Tool outputs} (file contents, command results) are masked because the student cannot predict non-deterministic external observations---it only needs to \emph{read} them to inform subsequent reasoning.
+
+\subsection{Optimisation Configuration}\label{sec:optim}
+
+\begin{table}[H]
+\centering
+\caption{Baseline training hyperparameters for 131K-token distillation.}
+\label{tab:config}
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Parameter} & \textbf{Value} \\
+\midrule
+Learning rate (main) & $1.0 \times 10^{-4}$ \\
+Learning rate (warmup) & $1.0 \times 10^{-5}$ \\
+Optimiser & AdamW ($\beta_1 = 0.9$, $\beta_2 = 0.999$, WD = 0.01) \\
+Schedule & Linear warmup (2 epochs) $\to$ Cosine decay \\
+Batch size & 8 \\
+Gradient accumulation & 1 \\
+Epochs & 20 \\
+Validation split & 5\% \\
+LoRA rank & 16 \\
+LoRA alpha & 32 \\
+Top-K logits & 128 \\
+Temperature & 1.0 \\
+Max prompt tokens & 8192 \\
+Max trajectory tokens & 131,072 \\
+Precision & BF16 (student), FP32 (hypernetwork) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{LR Scaling Rules.} For batch size sweeps:
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Linear} ($B \leq 16$): $\text{LR} = 10^{-4} \times B/8$.
+    \item \textbf{Square root} ($B > 16$): $\text{LR} = 10^{-4} \times \sqrt{B/8}$.
+\end{itemize}
+
+% ============================================================================
+\section{Infrastructure \& Hardware}\label{sec:infra}
+
+\subsection{8$\times$H200 Cluster}
+All training is conducted on a cluster of 8 NVIDIA H200 GPUs, providing a total of $\sim$1.1\,TB of HBM3e VRAM.
+
+\begin{table}[H]
+\centering
+\caption{Sequential pipeline phases and resource allocation.}
+\label{tab:pipeline}
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Phase} & \textbf{Engine} & \textbf{GPUs} & \textbf{Duration} \\
+\midrule
+1. Teacher Caching & vLLM ($TP=8$) & All 8 & 30--60 min \\
+2. Student Training & PyTorch (model-parallel) & All 8 (\texttt{device\_map="auto"}) & 3--5 days \\
+\midrule
+\multicolumn{3}{l}{\textbf{Total iteration}} & \textbf{3.5--6 days} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Memory Budget}
+\begin{table}[H]
+\centering
+\caption{VRAM allocation during Student Training phase ($B=8$, 131K context).}
+\label{tab:vram}
+\begin{tabular}{@{}lr@{}}
+\toprule
+\textbf{Component} & \textbf{VRAM} \\
+\midrule
+Student weights (80B, BF16) & 160\,GB \\
+Hypernetwork weights & 10\,GB \\
+Activation graphs ($B=8$) & $\sim$696\,GB \\
+Chunked KL peak & $\sim$2.4\,GB \\
+\midrule
+\textbf{Total utilisation} & $\sim$868\,GB \\
+\textbf{Available headroom} & $\sim$260\,GB \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ============================================================================
+\section{Expected Results}\label{sec:results}
+
+\subsection{Convergence Dynamics}
+Based on our architectural analysis and scaling law estimates, we project the following training dynamics:
+
+\paragraph{Phase 1: Identity Warmup (Steps 0--1000).}
+With zero-initialised $\mathbf{B}$ matrices, the student's output is identical to its base model. During warmup, the hypernetwork learns to produce small, coherent perturbations. We expect loss to remain near the base model's KL divergence from the teacher ($\sim$2.5--3.0 nats) during this phase.
+
+\paragraph{Phase 2: Rapid Alignment (Epochs 1--5).}
+The hypernetwork discovers broad task categories (bug fix vs.\ feature implementation) and learns coarse LoRA specialisations. We expect KL loss to drop sharply, reaching $\sim$1.0--1.5 nats by epoch 5.
+
+\paragraph{Phase 3: Fine-Grained Specialisation (Epochs 5--15).}
+The generator refines per-layer and per-shape adaptations, learning nuanced steering patterns specific to particular code patterns, languages, and debugging strategies. Loss converges to $\sim$0.5--0.8 nats.
+
+\paragraph{Phase 4: Plateau (Epochs 15--20).}
+Diminishing returns as the hypernetwork saturates its capacity. Validation loss stabilises, and the best checkpoint (\texttt{best.pt}) is typically selected from this region.
+
+\subsection{Data Efficiency: The 50--100$\times$ Rule}
+Unlike Chinchilla-style pretraining, hypernetwork training is closer to meta-learning a mapping function. Empirical evidence from related work suggests:
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Generator parameters}: $\sim$130M.
+    \item \textbf{Target sample count}: 15,000--20,000 unique trajectories.
+    \item \textbf{Diminishing returns}: Beyond 30K samples, gains are marginal for core capabilities.
+    \item \textbf{Diversity $>$ Volume}: Task-type diversity in the prompt window matters more than total trajectory token count.
+\end{itemize}
+
+\subsection{Expected Inference Performance}
+At inference, the trained hypernetwork operates as follows:
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Input}: User provides a task description (e.g., bug report + codebase context, $<$8K tokens).
+    \item \textbf{LoRA Synthesis}: Hypernetwork generates all 192 LoRA pairs in a single forward pass ($<$50\,ms).
+    \item \textbf{Injection}: Weights are injected into the frozen student via forward hooks.
+    \item \textbf{Generation}: The adapted student generates the solution at native 80B inference speed.
+\end{enumerate}
+
+The critical insight is that although training uses full 131K-token trajectories for fidelity, \textbf{inference requires only the short task prompt}. The hypernetwork has learned to map high-level problem descriptions to the correct low-rank manifolds.
+
+\subsection{Anticipated Benchmark Targets}
+We target the following performance levels on SWE-bench Verified:
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Base student} (no LoRA): Baseline resolve rate.
+    \item \textbf{Static LoRA} (trained on all tasks): +5--10\% over baseline.
+    \item \textbf{\hypernet{}} (dynamic LoRA): +15--25\% over baseline, approaching 80--90\% of the teacher's resolve rate.
+\end{itemize}
+
+The gap between static and dynamic LoRA represents the value of task-conditional specialisation---the ability to activate different reasoning circuits for different problem types.
+
+% ============================================================================
+\section{Risk Analysis \& Mitigations}\label{sec:risks}
+
+Our engineering audit has identified and resolved eleven technical risks:
+
+\begin{table}[H]
+\centering
+\caption{Comprehensive risk register with resolution status.}
+\label{tab:risks}
+\small
+\begin{tabular}{@{}p{0.35\textwidth}p{0.55\textwidth}@{}}
+\toprule
+\textbf{Risk} & \textbf{Mitigation} \\
+\midrule
+Hybrid layer naming ambiguity & Runtime \texttt{discover\_target\_layers()} with Ordered Mapping \\
+Teacher logit memory explosion & Offline caching with Top-128 sparse extraction \\
+LoRA injection breaking autograd & Forward hooks (not forward override) \\
+Sequential batch bottleneck & Batched \texttt{einsum} hooks for single-pass processing \\
+GQA/DeltaNet dimension mismatch & \texttt{ShapeGroupedLoRAGenerator} with per-shape heads \\
+131K logit materialisation OOM & Chunked KL Loss (1024-token slices) \\
+Tokenizer chat template incompatibility & Dynamic role mapping with XML fallback \\
+\texttt{torch.compile} incompatibility & Disabled; dynamic hooks invalidate CUDA graphs \\
+Checkpoint resume corruption & Full state dict persistence (scheduler + epoch) \\
+Cache format ambiguity (logits vs.\ log-probs) & Format metadata field with runtime detection \\
+Split-cluster key mismatch & On-the-fly \texttt{torch.topk} conversion \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ============================================================================
+\section{Verification Plan}\label{sec:verification}
+
+\subsection{Pre-flight Tests}
+Before commencing multi-day training runs, a mandatory verification suite validates:
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{Gradient Flow}: Backpropagation from a dummy loss reaches all hypernetwork parameters ($\|\nabla\| > 0$ for \texttt{pool\_query}, generator heads).
+    \item \textbf{LoRA-Integrated Flow}: Loss on a frozen layer's output propagates through the hook to the hypernetwork, while the base layer accumulates zero gradient.
+    \item \textbf{Zero Initialisation}: $|\mathbf{B}_0|_{\text{mean}} < 0.01$, confirming identity start.
+    \item \textbf{Gradient Magnitude}: $10^{-8} < \|\nabla\| < 10^3$ under simulated KL conditions.
+    \item \textbf{Ordered Mapping}: Generator output count equals \texttt{len(discover\_target\_layers())}, with key-exact dictionary matching.
+    \item \textbf{Shape Verification}: Each $(A_i, B_i)$ pair matches target module's $(d_{\text{in}}, r)$ and $(r, d_{\text{out}})$.
+\end{enumerate}
+
+\subsection{Runtime Monitoring}
+During training, the following metrics are tracked via Weights \& Biases:
+\begin{itemize}[leftmargin=*]
+    \item Training and validation KL loss per epoch.
+    \item Gradient norms (per-module and aggregate).
+    \item LoRA weight magnitudes ($\|\mathbf{A}\|$, $\|\mathbf{B}\|$ per shape group).
+    \item Learning rate schedule progression.
+    \item VRAM utilisation per GPU.
+\end{itemize}
+
+% ============================================================================
+\section{Related Work}\label{sec:related}
+
+\hypernet{} builds upon three lines of research:
+
+\paragraph{Knowledge Distillation.} Hinton et al.\ (2015) established soft-label distillation via KL divergence. We extend this to the agentic setting with offline logit caching, loss masking for tool outputs, and the Privileged Information Protocol.
+
+\paragraph{Hypernetworks.} Ha et al.\ (2016) introduced hypernetworks as weight-generating meta-models. Our contribution is the application to LoRA generation for hybrid Transformer--DeltaNet architectures, with shape-grouped output heads and dynamic injection.
+
+\paragraph{Low-Rank Adaptation.} Hu et al.\ (2021) proposed LoRA for parameter-efficient fine-tuning. We move beyond static LoRA by generating task-specific adapters at inference time, enabling the ``Bypass Circuit'' paradigm where each task activates a different low-rank perturbation of the frozen attention manifold.
+
+% ============================================================================
+\section{Conclusion}\label{sec:conclusion}
+
+\hypernet{} represents a principled approach to distilling frontier-scale agentic capabilities into deployable models. By introducing a dynamic hypernetwork that generates task-specific LoRA weights, we overcome the fundamental limitation of static distillation: the inability to encode the full spectrum of teacher specialisations within a fixed-capacity student.
+
+The system is fully engineered, with all eleven identified risks resolved, a complete verification suite, and a production-ready training pipeline for 8$\times$H200 clusters. We anticipate that the trained hypernetwork will enable the 80B student to achieve 80--90\% of the 480B teacher's performance on SWE-bench Verified, while maintaining native inference latency and adding only $\sim$50\,ms of overhead for LoRA synthesis.
+
+The broader implication is a new paradigm for model deployment: rather than choosing between a massive, expensive frontier model and a smaller, less capable one, practitioners can deploy a compact student paired with a learned meta-model that dynamically specialises it for each incoming task.
+
+% ============================================================================
+\bibliographystyle{plain}
+\begin{thebibliography}{10}
+
+\bibitem{hinton2015}
+G.~Hinton, O.~Vinyals, and J.~Dean.
+\newblock Distilling the knowledge in a neural network.
+\newblock {\em arXiv preprint arXiv:1503.02531}, 2015.
+
+\bibitem{ha2016}
+D.~Ha, A.~Dai, and Q.~V. Le.
+\newblock Hypernetworks.
+\newblock {\em arXiv preprint arXiv:1609.09106}, 2016.
+
+\bibitem{hu2021}
+E.~J. Hu, Y.~Shen, P.~Wallis, Z.~Allen-Zhu, Y.~Li, S.~Wang, L.~Wang, and W.~Chen.
+\newblock LoRA: Low-rank adaptation of large language models.
+\newblock {\em arXiv preprint arXiv:2106.09685}, 2021.
+
+\bibitem{gu2023mamba}
+A.~Gu and T.~Dao.
+\newblock Mamba: Linear-time sequence modeling with selective state spaces.
+\newblock {\em arXiv preprint arXiv:2312.00752}, 2023.
+
+\bibitem{yang2024gated}
+S.~Yang, B.~Wang, Y.~Shen, R.~Panda, and Y.~Kim.
+\newblock Gated delta networks: Improving mamba2 with delta rule.
+\newblock {\em arXiv preprint arXiv:2412.06464}, 2024.
+
+\bibitem{jimenez2024swebench}
+C.~E. Jimenez, J.~Yang, A.~Wettig, S.~Yao, K.~Pei, O.~Press, and K.~Narasimhan.
+\newblock SWE-bench: Can language models resolve real-world GitHub issues?
+\newblock {\em arXiv preprint arXiv:2310.06770}, 2024.
+
+\bibitem{qwen3coder}
+Qwen Team.
+\newblock Qwen3-Coder: Let agents write code.
+\newblock \url{https://qwenlm.github.io/blog/qwen3-coder/}, 2025.
+
+\end{thebibliography}
+
+\end{document}

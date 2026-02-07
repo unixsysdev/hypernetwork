@@ -281,9 +281,11 @@ def process_batch(
             seq_len = len(prompt_logprobs)
             values = np.zeros((seq_len, top_k), dtype=np.float16)
             token_indices = np.zeros((seq_len, top_k), dtype=np.int32)
+            valid_mask = np.ones(seq_len, dtype=np.int32)  # Track positions with real logprobs
             
             for pos, logprob_dict in enumerate(prompt_logprobs):
                 if logprob_dict is None:
+                    valid_mask[pos] = 0  # Mark as invalid (no logprobs from vLLM)
                     continue
                 
                 # Sort by logprob value
@@ -304,6 +306,9 @@ def process_batch(
                 text, assistant_ranges, prompt_boundary_char,
                 tokenizer, input_ids, max_tokens,
             )
+            
+            # AND valid_mask into loss_mask: zero-filled positions never contribute to loss
+            loss_mask = loss_mask * valid_mask[:len(loss_mask)]
             
             # Save with format marker, loss mask, and prompt boundary
             np.savez_compressed(

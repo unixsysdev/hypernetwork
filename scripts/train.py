@@ -2,15 +2,11 @@
 """
 Main training entry point.
 
+The trainer uses model parallelism (device_map="auto") to shard the student
+across available GPUs. This is a single-process script — NOT data-parallel.
+
 Usage:
-    # Single GPU (for testing)
     python scripts/train.py --config configs/train_config.yaml
-    
-    # Multi-GPU with torchrun
-    torchrun --nproc_per_node=4 scripts/train.py --config configs/train_config.yaml
-    
-    # Full 8x H200 cluster
-    torchrun --nproc_per_node=8 scripts/train.py --config configs/train_config.yaml --full_cluster
 """
 
 import argparse
@@ -85,11 +81,6 @@ def main():
         type=str,
         default="configs/train_config.yaml",
         help="Path to training configuration YAML",
-    )
-    parser.add_argument(
-        "--full_cluster",
-        action="store_true",
-        help="Use full 8x H200 cluster configuration",
     )
     parser.add_argument(
         "--resume",

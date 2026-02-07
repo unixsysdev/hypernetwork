@@ -646,6 +646,9 @@ class DistillationTrainer:
             prompt_ids = batch["prompt_ids"].to(self.device)
             prompt_mask = batch["prompt_mask"].to(self.device)
             
+            # Use loss_mask for consistent metric with training objective
+            loss_mask = batch["loss_mask"].to(self.device) if "loss_mask" in batch else attention_mask
+            
             has_cached_teacher = (
                 self.config.use_cached_teacher
                 and "teacher_values" in batch
@@ -674,7 +677,7 @@ class DistillationTrainer:
                     student_logits,
                     teacher_values,
                     teacher_indices,
-                    attention_mask,
+                    loss_mask,
                     teacher_format=teacher_format,
                 )
             else:
@@ -685,7 +688,7 @@ class DistillationTrainer:
                 loss = compute_distillation_loss(
                     student_logits,
                     teacher_outputs.logits,
-                    attention_mask,
+                    loss_mask,
                     top_k=self.config.top_k_logits,
                     temperature=self.config.temperature,
                 )
