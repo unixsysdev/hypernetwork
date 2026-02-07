@@ -86,11 +86,33 @@ class CachedDistillationDataset(Dataset):
         # Create attention mask (1 for real tokens)
         attention_mask = torch.ones_like(input_ids)
         
-        # Extract prompt tokens for Hypernetwork
-        prompt_ids = input_ids[:self.max_prompt_tokens]
-        prompt_mask = attention_mask[:self.max_prompt_tokens]
+        # Load loss mask: 1 for assistant tokens, 0 for system/user/tool
+        # Falls back to all-ones for old caches without loss_mask
+        if 'loss_mask' in data:
+            loss_mask = torch.from_numpy(data['loss_mask'].astype(np.int64))
+            if len(loss_mask) > len(input_ids):
+                loss_mask = loss_mask[:len(input_ids)]
+            elif len(loss_mask) < len(input_ids):
+                loss_mask = torch.cat([
+                    loss_mask,
+                    torch.zeros(len(input_ids) - len(loss_mask), dtype=torch.long),
+                ])
+        else:
+            loss_mask = torch.ones_like(input_ids)
         
-        # Pad prompt if shorter
+        # Load prompt boundary: token index where first assistant turn starts
+        # Hypernetwork should only see tokens BEFORE this boundary (system+user only)
+        if 'prompt_boundary' in data:
+            prompt_boundary = int(data['prompt_boundary'][0])
+        else:
+            prompt_boundary = self.max_prompt_tokens  # fallback for old caches
+        
+        # Cap prompt at min(prompt_boundary, max_prompt_tokens)
+        prompt_len = min(prompt_boundary, self.max_prompt_tokens)
+        prompt_ids = input_ids[:prompt_len]
+        prompt_mask = attention_mask[:prompt_len]
+        
+        # Pad prompt to max_prompt_tokens
         if len(prompt_ids) < self.max_prompt_tokens:
             pad_len = self.max_prompt_tokens - len(prompt_ids)
             prompt_ids = torch.cat([
@@ -121,6 +143,7 @@ class CachedDistillationDataset(Dataset):
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
+            "loss_mask": loss_mask,                # [seq_len] - 1=assistant, 0=other
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
             "teacher_values": teacher_values,      # [seq_len, top_k]
@@ -342,17 +365,19 @@ def collate_fn_with_teacher(
     max_length: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
     """
-    Collate function that handles teacher logits.
+    Collate function that handles teacher logits and loss masks.
     """
     batch_max_len = max(len(item["input_ids"]) for item in batch)
     if max_length:
         batch_max_len = min(batch_max_len, max_length)
     
     has_teacher = "teacher_values" in batch[0]
+    has_loss_mask = "loss_mask" in batch[0]
     top_k = batch[0]["teacher_values"].shape[-1] if has_teacher else 128
     
     input_ids_list = []
     attention_mask_list = []
+    loss_mask_list = []
     prompt_ids_list = []
     prompt_mask_list = []
     teacher_values_list = []
@@ -372,6 +397,13 @@ def collate_fn_with_teacher(
         prompt_ids_list.append(item["prompt_ids"])
         prompt_mask_list.append(item["prompt_mask"])
         
+        # Loss mask: pad with 0 (don't compute loss on padding)
+        if has_loss_mask:
+            lm = item["loss_mask"][:batch_max_len]
+            if len(lm) < batch_max_len:
+                lm = torch.cat([lm, torch.zeros(batch_max_len - len(lm), dtype=torch.long)])
+            loss_mask_list.append(lm)
+        
         if has_teacher:
             tv = item["teacher_values"][:batch_max_len]
             ti = item["teacher_indices"][:batch_max_len]
@@ -390,6 +422,9 @@ def collate_fn_with_teacher(
         "prompt_ids": torch.stack(prompt_ids_list),
         "prompt_mask": torch.stack(prompt_mask_list),
     }
+    
+    if has_loss_mask:
+        result["loss_mask"] = torch.stack(loss_mask_list)
     
     if has_teacher:
         result["teacher_values"] = torch.stack(teacher_values_list)

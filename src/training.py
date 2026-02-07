@@ -424,6 +424,9 @@ class DistillationTrainer:
         prompt_ids = batch["prompt_ids"].to(self.device)
         prompt_mask = batch["prompt_mask"].to(self.device)
         
+        # Loss mask: 1=assistant tokens, 0=other (falls back to attention_mask)
+        loss_mask = batch["loss_mask"].to(self.device) if "loss_mask" in batch else attention_mask
+        
         # Check if we have cached teacher logits
         has_cached_teacher = (
             self.config.use_cached_teacher and 
@@ -462,11 +465,12 @@ class DistillationTrainer:
             # 4. Get teacher logits
             if has_cached_teacher:
                 # Use cached sparse teacher logits
+                # NOTE: loss_mask used here, NOT attention_mask — loss on assistant tokens only
                 loss = self._compute_sparse_kl_loss(
                     student_logits[0],  # [L, V]
                     teacher_values[b],   # [L, K]
                     teacher_indices[b],  # [L, K]
-                    attention_mask[b],   # [L]
+                    loss_mask[b],        # [L] - assistant-only mask
                     teacher_format=teacher_format,
                 )
             else:
@@ -481,7 +485,7 @@ class DistillationTrainer:
                 loss = compute_distillation_loss(
                     student_logits,
                     teacher_logits,
-                    attention_mask[b:b+1],
+                    loss_mask[b:b+1],
                     top_k=self.config.top_k_logits,
                     temperature=self.config.temperature,
                 )
@@ -516,6 +520,9 @@ class DistillationTrainer:
         prompt_ids = batch["prompt_ids"].to(self.device)
         prompt_mask = batch["prompt_mask"].to(self.device)
         
+        # Loss mask: 1=assistant tokens, 0=other (falls back to attention_mask)
+        loss_mask = batch["loss_mask"].to(self.device) if "loss_mask" in batch else attention_mask
+        
         has_cached_teacher = (
             self.config.use_cached_teacher and 
             "teacher_values" in batch and 
@@ -545,13 +552,13 @@ class DistillationTrainer:
             )
             student_logits = student_outputs.logits  # [B, L, V]
         
-        # Compute loss
+        # Compute loss — uses loss_mask (assistant-only), NOT attention_mask
         if has_cached_teacher:
             loss = self._compute_batched_sparse_kl_loss(
                 student_logits,
                 teacher_values,
                 teacher_indices,
-                attention_mask,
+                loss_mask,
                 teacher_format=teacher_format,
             )
         else:
@@ -563,7 +570,7 @@ class DistillationTrainer:
             loss = compute_distillation_loss(
                 student_logits,
                 teacher_outputs.logits,
-                attention_mask,
+                loss_mask,
                 top_k=self.config.top_k_logits,
                 temperature=self.config.temperature,
             )
