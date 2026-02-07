@@ -144,7 +144,7 @@ For $D = 2048$ and $r = 16$, the generator heads alone contribute:
 \begin{equation}
     \text{Params}_{\text{heads}} = \sum_{g \in \text{Groups}} D \cdot (d^g_{\text{in}} \cdot r + r \cdot d^g_{\text{out}})
 \end{equation}
-Across the four shape groups, this yields approximately 400--800M parameters in the output heads. Combined with the encoder and embeddings, the full hypernetwork totals $\sim$130M trainable parameters.
+Across the four shape groups with $r = 16$, this yields approximately 100M parameters in the output heads. Combined with the encoder ($\sim$17M) and per-layer embeddings ($\sim$13M), the full hypernetwork totals $\sim$130M trainable parameters.
 
 \subsection{LoRA Injection via Forward Hooks}\label{sec:injection}
 

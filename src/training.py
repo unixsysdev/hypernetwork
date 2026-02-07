@@ -627,6 +627,16 @@ class DistillationTrainer:
                             **metrics,
                         })
         
+        # Flush any remaining accumulated gradients from a partial final batch
+        if (step + 1) % self.config.gradient_accumulation_steps != 0:
+            torch.nn.utils.clip_grad_norm_(
+                self.hypernetwork.parameters(),
+                self.config.max_grad_norm,
+            )
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+            self.scheduler.step()
+        
         return {"avg_loss": total_loss / max(num_steps, 1)}
     
     @torch.no_grad()

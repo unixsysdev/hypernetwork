@@ -12,13 +12,13 @@ pip install -r requirements.txt
 python tests/test_gradient_flow.py
 
 # 3. Cache teacher logits (10-20x faster than runtime inference)
-python scripts/cache_teacher_vllm.py --tp 8 --max_trajectories 30000
+python scripts/cache_teacher_vllm.py --output_dir ./data/cache --tp 8 --max_samples 30000
 
 # 4. Start training
 python scripts/train.py --config configs/train_config.yaml
 
-# Multi-GPU training
-torchrun --nproc_per_node=8 scripts/train.py --config configs/train_config.yaml
+# Multi-GPU: uses device_map="auto" to shard student across all visible GPUs
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python scripts/train.py --config configs/train_config.yaml
 ```
 
 ## Architecture
